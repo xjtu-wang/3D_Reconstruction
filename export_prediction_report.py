@@ -354,6 +354,27 @@ def maybe_save_rollout(
     return output_path
 
 
+def sequence_point_counts(clouds: Sequence[np.ndarray]) -> List[int]:
+    return [int(cloud.shape[0]) for cloud in clouds]
+
+
+def summarize_counts(counts: Sequence[int]) -> Dict[str, Optional[float]]:
+    if not counts:
+        return {
+            "min": None,
+            "max": None,
+            "mean": None,
+            "median": None,
+        }
+    counts_array = np.asarray(counts, dtype=np.int32)
+    return {
+        "min": float(counts_array.min()),
+        "max": float(counts_array.max()),
+        "mean": float(counts_array.mean()),
+        "median": float(np.median(counts_array)),
+    }
+
+
 def downsample_points(points: np.ndarray, max_points: int, rng: np.random.Generator) -> np.ndarray:
     if max_points <= 0 or points.shape[0] <= max_points:
         return points.astype(np.float32, copy=False)
@@ -517,6 +538,8 @@ def write_metadata(
     trajectory_path: Path,
     timesteps: Sequence[int],
     rendered_counts: Dict[str, List[int]],
+    raw_counts: Dict[str, List[int]],
+    raw_count_summary: Dict[str, Dict[str, Optional[float]]],
     disable_feedback: bool,
     checkpoint_metadata: Dict[str, object],
 ) -> Path:
@@ -528,6 +551,8 @@ def write_metadata(
         "timesteps": list(timesteps),
         "mode": "current_measurement_only" if disable_feedback else "autoregressive_rollout",
         "rendered_counts": rendered_counts,
+        "raw_counts": raw_counts,
+        "raw_count_summary": raw_count_summary,
         "checkpoint_epoch": checkpoint_metadata.get("epoch"),
         "checkpoint_global_step": checkpoint_metadata.get("global_step"),
         "train_metrics": checkpoint_metadata.get("train_metrics"),
@@ -579,6 +604,19 @@ def main() -> None:
         disable_feedback=args.disable_feedback,
         pruning_threshold=args.pruning_threshold,
     )
+    measurement_counts = sequence_point_counts(measurements)
+    prediction_counts = sequence_point_counts(predictions)
+    ground_truth_counts = sequence_point_counts(ground_truth)
+    raw_counts = {
+        "measurement": measurement_counts,
+        "prediction": prediction_counts,
+        "ground_truth": ground_truth_counts,
+    }
+    raw_count_summary = {
+        "measurement": summarize_counts(measurement_counts),
+        "prediction": summarize_counts(prediction_counts),
+        "ground_truth": summarize_counts(ground_truth_counts),
+    }
     rollout_path = maybe_save_rollout(save_rollout_path, poses, predictions)
     rendered_counts = render_report_figure(
         output_path=output_path,
@@ -606,6 +644,8 @@ def main() -> None:
         trajectory_path=trajectory_path,
         timesteps=timesteps,
         rendered_counts=rendered_counts,
+        raw_counts=raw_counts,
+        raw_count_summary=raw_count_summary,
         disable_feedback=args.disable_feedback,
         checkpoint_metadata=checkpoint_metadata,
     )
@@ -614,6 +654,12 @@ def main() -> None:
     print(f"trajectory: {trajectory_path}")
     print(f"device: {device}")
     print(f"timesteps shown: {timesteps}")
+    print(f"prediction count summary: {raw_count_summary['prediction']}")
+    print(
+        "selected prediction counts: {}".format(
+            {int(step): prediction_counts[step] for step in timesteps}
+        )
+    )
     print(f"saved figure: {output_path}")
     print(f"saved metadata: {metadata_path}")
     if rollout_path is not None:
