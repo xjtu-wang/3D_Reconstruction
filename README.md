@@ -135,6 +135,48 @@ Notes:
 - `open3d` is optional and not listed in the minimal training dependencies. Install it separately with `pip install open3d`.
 - `--timestep all` should be used with `--space world`; stacking multiple local robot frames is not meaningful.
 
+## Report Figures
+
+To export paper-style static figures from a trained checkpoint:
+
+```bash
+python export_prediction_report.py \
+  --checkpoint path/to/best_checkpoint.pt \
+  --trajectory data/trajectory_000.npz \
+  --timesteps 0 30 \
+  --output outputs/fig4_style.png
+```
+
+Useful variants:
+
+```bash
+# Let the script pick two evenly spaced columns automatically.
+python export_prediction_report.py \
+  --checkpoint path/to/best_checkpoint.pt \
+  --trajectory data/trajectory_000.npz \
+  --output outputs/report_auto.png
+
+# Disable autoregressive feedback to mimic a zero-shot current-frame estimate.
+python export_prediction_report.py \
+  --checkpoint path/to/best_checkpoint.pt \
+  --trajectory data/trajectory_000.npz \
+  --timesteps 12 \
+  --disable-feedback \
+  --output outputs/fig5_style.png
+
+# Save the full predicted rollout for later inspection.
+python export_prediction_report.py \
+  --checkpoint path/to/best_checkpoint.pt \
+  --trajectory data/trajectory_000.npz \
+  --output outputs/report.png \
+  --save-rollout outputs/trajectory_000_predictions.npz
+```
+
+Notes:
+
+- The figure layout follows the paper-style comparison of `Measurement / Reconstruction / Ground truth`.
+- `matplotlib` is required for figure export and is optional relative to the minimal training dependencies.
+
 ## Dependencies
 
 Minimum Python packages:
