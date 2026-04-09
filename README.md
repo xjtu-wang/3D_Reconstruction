@@ -91,6 +91,7 @@ What it does:
 - Builds paper-style structured scenes with stairs, boxes, walls, poles, and narrow corridors.
 - Uses an ANYmal C asset with four depth cameras placed at the front, back, left, and right, tilted downward by `30°`.
 - Writes packed `.npz` trajectories in the exact format expected by `train.py`.
+- Can optionally save each camera's robot-local point cloud alongside the fused measurement cloud for later multi-view experiments.
 
 Useful flags:
 
@@ -100,6 +101,9 @@ Useful flags:
   --asset-root omniverse://localhost/NVIDIA/Assets/Isaac/4.5 \
   --camera-width 1280 \
   --camera-height 800 \
+  --trajectory-mode velocity_command \
+  --camera-layout leg_proxy \
+  --save-raw-camera-clouds \
   --show-ui \
   --show-robot
 ```
@@ -108,6 +112,9 @@ Notes:
 
 - If the ANYmal C asset is not under the default Isaac Sim asset root, pass `--robot-usd` or `--asset-root`.
 - The original paper used a rough-terrain locomotion policy to move the robot. This repo currently uses a kinematically sampled reachable base trajectory with the same scene and sensor configuration, because the original policy checkpoint is not part of this repository.
+- The paper-faithful camera rig is still `front/back/left/right` with `30°` downward tilt. `--camera-layout leg_proxy` is exploratory only and should not be treated as the main reproduction setting.
+- `--camera-layout leg_proxy` is a collection baseline that approximates one camera near each leg corner in the base frame. It is useful for data-pipeline validation, but it is not a true articulated leg-link attachment.
+- See [`docs/isaaclab_reproduction_baseline.md`](docs/isaaclab_reproduction_baseline.md) for a practical migration path from this collector to an Isaac Lab policy-driven rollout.
 
 ## Open3D Visualization
 

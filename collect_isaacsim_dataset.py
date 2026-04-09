@@ -111,10 +111,79 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-mount-x", type=float, default=0.34)
     parser.add_argument("--camera-mount-y", type=float, default=0.18)
     parser.add_argument(
+        "--camera-leg-z",
+        type=float,
+        default=-0.28,
+        help=(
+            "Approximate camera z-offset in the robot base frame when using --camera-layout leg_proxy. "
+            "This is a fixed proxy for nominal leg-mounted cameras, not a true articulated leg attachment."
+        ),
+    )
+    parser.add_argument(
         "--camera-down-tilt-deg",
         type=float,
         default=30.0,
         help="Paper-faithful default: 30 degrees downward tilt.",
+    )
+    parser.add_argument(
+        "--camera-layout",
+        type=str,
+        choices=("paper_cross", "leg_proxy"),
+        default="paper_cross",
+        help=(
+            "Camera rig layout. "
+            "'paper_cross' matches the current paper-style front/back/left/right layout. "
+            "'leg_proxy' approximates one camera near each leg corner, fixed in the base frame."
+        ),
+    )
+    parser.add_argument(
+        "--trajectory-mode",
+        type=str,
+        choices=("sinusoid", "velocity_command"),
+        default="sinusoid",
+        help=(
+            "Base-trajectory generator. "
+            "'sinusoid' keeps the original scene sweep. "
+            "'velocity_command' integrates random commanded body velocities to better mimic locomotion rollout data."
+        ),
+    )
+    parser.add_argument(
+        "--command-resample-steps",
+        type=int,
+        default=8,
+        help="Steps between velocity-command resampling when --trajectory-mode velocity_command is used.",
+    )
+    parser.add_argument(
+        "--command-lin-vel-x-range",
+        type=float,
+        nargs=2,
+        default=(0.30, 1.00),
+        metavar=("MIN", "MAX"),
+        help="Sampled body-frame forward-velocity range in m/s for --trajectory-mode velocity_command.",
+    )
+    parser.add_argument(
+        "--command-lin-vel-y-range",
+        type=float,
+        nargs=2,
+        default=(-0.20, 0.20),
+        metavar=("MIN", "MAX"),
+        help="Sampled body-frame lateral-velocity range in m/s for --trajectory-mode velocity_command.",
+    )
+    parser.add_argument(
+        "--command-yaw-rate-range-deg",
+        type=float,
+        nargs=2,
+        default=(-20.0, 20.0),
+        metavar=("MIN", "MAX"),
+        help="Sampled yaw-rate range in deg/s for --trajectory-mode velocity_command.",
+    )
+    parser.add_argument(
+        "--save-raw-camera-clouds",
+        action="store_true",
+        help=(
+            "Store each camera's robot-local point cloud in the trajectory .npz alongside the fused "
+            "measurement_points arrays expected by train.py."
+        ),
     )
     parser.add_argument(
         "--debug-camera",
@@ -134,6 +203,14 @@ def normalize(vector: np.ndarray) -> np.ndarray:
     if norm < 1e-8:
         raise ValueError("Zero-length vector cannot be normalized.")
     return (vector / norm).astype(np.float32)
+
+
+def sorted_pair(values: Sequence[float]) -> Tuple[float, float]:
+    if len(values) != 2:
+        raise ValueError(f"Expected a pair of values, received {values}")
+    first = float(values[0])
+    second = float(values[1])
+    return (first, second) if first <= second else (second, first)
 
 
 def rotation_matrix_to_quaternion(rotation: np.ndarray) -> np.ndarray:
@@ -259,10 +336,70 @@ def pack_clouds(clouds: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
     return packed_points, np.asarray(splits, dtype=np.int32)
 
 
+def _unique_row_view(array: np.ndarray) -> np.ndarray:
+    contiguous = np.ascontiguousarray(array)
+    return contiguous.view(np.dtype((np.void, contiguous.dtype.itemsize * contiguous.shape[1])))
+
+
+def estimate_visible_ground_truth_fraction(
+    ground_truth_local: np.ndarray,
+    measurement_local: np.ndarray,
+    voxel_size: float,
+    origin: np.ndarray,
+) -> float:
+    if ground_truth_local.size == 0:
+        return 0.0
+    if measurement_local.size == 0:
+        return 0.0
+
+    gt_voxels = np.floor((ground_truth_local.astype(np.float32) - origin[None, :]) / voxel_size).astype(np.int32)
+    measurement_voxels = np.floor((measurement_local.astype(np.float32) - origin[None, :]) / voxel_size).astype(np.int32)
+    if gt_voxels.size == 0 or measurement_voxels.size == 0:
+        return 0.0
+
+    gt_view = _unique_row_view(gt_voxels).reshape(-1)
+    measurement_view = np.unique(_unique_row_view(measurement_voxels).reshape(-1))
+    visible_mask = np.isin(gt_view, measurement_view, assume_unique=False)
+    return float(np.mean(visible_mask)) if visible_mask.size > 0 else 0.0
+
+
 def build_camera_mounts(args: argparse.Namespace) -> Tuple[CameraMount, ...]:
     tilt = math.radians(args.camera_down_tilt_deg)
     forward_component = math.cos(tilt)
     down_component = math.sin(tilt)
+    if args.camera_layout == "leg_proxy":
+        diagonal_component = forward_component / math.sqrt(2.0)
+        return (
+            CameraMount(
+                name="front_left",
+                translation_in_base=np.array([args.camera_mount_x, args.camera_mount_y, args.camera_leg_z], dtype=np.float32),
+                forward_in_base=normalize(
+                    np.array([diagonal_component, diagonal_component, -down_component], dtype=np.float32)
+                ),
+            ),
+            CameraMount(
+                name="front_right",
+                translation_in_base=np.array([args.camera_mount_x, -args.camera_mount_y, args.camera_leg_z], dtype=np.float32),
+                forward_in_base=normalize(
+                    np.array([diagonal_component, -diagonal_component, -down_component], dtype=np.float32)
+                ),
+            ),
+            CameraMount(
+                name="rear_left",
+                translation_in_base=np.array([-args.camera_mount_x, args.camera_mount_y, args.camera_leg_z], dtype=np.float32),
+                forward_in_base=normalize(
+                    np.array([-diagonal_component, diagonal_component, -down_component], dtype=np.float32)
+                ),
+            ),
+            CameraMount(
+                name="rear_right",
+                translation_in_base=np.array([-args.camera_mount_x, -args.camera_mount_y, args.camera_leg_z], dtype=np.float32),
+                forward_in_base=normalize(
+                    np.array([-diagonal_component, -diagonal_component, -down_component], dtype=np.float32)
+                ),
+            ),
+        )
+
     return (
         CameraMount(
             name="front",
@@ -455,7 +592,7 @@ def build_scene_ground_truth(scene: SceneDescription, spacing: float) -> np.ndar
     return np.concatenate(samples, axis=0).astype(np.float32, copy=False)
 
 
-def generate_robot_poses(
+def generate_sinusoid_robot_poses(
     scene: SceneDescription,
     timesteps: int,
     nominal_base_height: float,
@@ -489,7 +626,106 @@ def generate_robot_poses(
     return poses.astype(np.float32, copy=False)
 
 
-def save_manifest(output_dir: Path, args: argparse.Namespace, robot_usd_path: str, trajectories: List[Dict[str, object]]) -> None:
+def generate_velocity_command_robot_poses(
+    scene: SceneDescription,
+    timesteps: int,
+    nominal_base_height: float,
+    sample_dt: float,
+    rng: np.random.Generator,
+    args: argparse.Namespace,
+) -> np.ndarray:
+    lin_vel_x_range = sorted_pair(args.command_lin_vel_x_range)
+    lin_vel_y_range = sorted_pair(args.command_lin_vel_y_range)
+    yaw_rate_range_deg = sorted_pair(args.command_yaw_rate_range_deg)
+    yaw_rate_range = tuple(math.radians(value) for value in yaw_rate_range_deg)
+    resample_steps = max(1, int(args.command_resample_steps))
+
+    x_limit = max(0.5 * scene.path_length - 0.25, 0.25)
+    y_limit = max(0.5 * scene.corridor_width - 0.20, 0.0)
+
+    positions_local = np.zeros((timesteps, 3), dtype=np.float32)
+    yaw_local = np.zeros((timesteps,), dtype=np.float32)
+
+    positions_local[0, 0] = -min(0.4 * scene.path_length, x_limit)
+    positions_local[0, 1] = float(rng.uniform(-0.10, 0.10)) if y_limit > 0.0 else 0.0
+    yaw_local[0] = float(rng.uniform(-math.radians(15.0), math.radians(15.0)))
+
+    body_velocity_command = np.array(
+        [
+            rng.uniform(*lin_vel_x_range),
+            rng.uniform(*lin_vel_y_range),
+        ],
+        dtype=np.float32,
+    )
+    yaw_rate = float(rng.uniform(*yaw_rate_range))
+
+    for index in range(timesteps):
+        x_local = float(positions_local[index, 0])
+        y_local = float(positions_local[index, 1])
+        positions_local[index, 2] = scene.support_height(x_local, y_local) + nominal_base_height
+        if index == timesteps - 1:
+            continue
+
+        if index % resample_steps == 0:
+            body_velocity_command = np.array(
+                [
+                    rng.uniform(*lin_vel_x_range),
+                    rng.uniform(*lin_vel_y_range),
+                ],
+                dtype=np.float32,
+            )
+            yaw_rate = float(rng.uniform(*yaw_rate_range))
+
+        yaw_local[index + 1] = yaw_local[index] + yaw_rate * sample_dt
+        planar_rotation = yaw_rotation_matrix(float(yaw_local[index]))[:2, :2]
+        delta_xy = planar_rotation @ body_velocity_command * sample_dt
+        next_xy = positions_local[index, :2] + delta_xy.astype(np.float32, copy=False)
+        next_xy[0] = float(np.clip(next_xy[0], -x_limit, x_limit))
+        next_xy[1] = float(np.clip(next_xy[1], -y_limit, y_limit))
+        positions_local[index + 1, :2] = next_xy
+
+    scene_rotation = yaw_rotation_matrix(scene.scene_yaw_radians)
+    poses = np.zeros((timesteps, 4, 4), dtype=np.float32)
+    for index in range(timesteps):
+        world_position = positions_local[index] @ scene_rotation.T
+        world_yaw = float(scene.scene_yaw_radians + yaw_local[index])
+        poses[index] = pose_matrix_from_yaw(world_position, world_yaw)
+
+    return poses.astype(np.float32, copy=False)
+
+
+def generate_robot_poses(
+    scene: SceneDescription,
+    timesteps: int,
+    nominal_base_height: float,
+    sample_dt: float,
+    rng: np.random.Generator,
+    args: argparse.Namespace,
+) -> np.ndarray:
+    if args.trajectory_mode == "velocity_command":
+        return generate_velocity_command_robot_poses(
+            scene=scene,
+            timesteps=timesteps,
+            nominal_base_height=nominal_base_height,
+            sample_dt=sample_dt,
+            rng=rng,
+            args=args,
+        )
+    return generate_sinusoid_robot_poses(
+        scene=scene,
+        timesteps=timesteps,
+        nominal_base_height=nominal_base_height,
+        rng=rng,
+    )
+
+
+def save_manifest(
+    output_dir: Path,
+    args: argparse.Namespace,
+    robot_usd_path: str,
+    trajectories: List[Dict[str, object]],
+    camera_mounts: Sequence[CameraMount],
+) -> None:
     manifest = {
         "paper_defaults": {
             "grid_shape": [64, 64, 64],
@@ -504,7 +740,8 @@ def save_manifest(output_dir: Path, args: argparse.Namespace, robot_usd_path: st
                 "corridor_width_m": [2.0, 6.0],
             },
             "sensor": {
-                "cameras": ["front", "back", "left", "right"],
+                "cameras": [mount.name for mount in camera_mounts],
+                "layout": args.camera_layout,
                 "tilt_deg": args.camera_down_tilt_deg,
                 "resolution": [args.camera_width, args.camera_height],
             },
@@ -793,10 +1030,20 @@ def run_collection(args: argparse.Namespace) -> None:
             scene: SceneDescription,
             measurements_local: List[np.ndarray],
             ground_truth_local: List[np.ndarray],
+            visible_ground_truth_fractions: List[float],
+            raw_camera_clouds_local: Optional[Dict[str, List[np.ndarray]]],
             partial: bool,
         ) -> Dict[str, object]:
             measurement_points, measurement_splits = pack_clouds(measurements_local)
             ground_truth_points, ground_truth_splits = pack_clouds(ground_truth_local)
+            extra_arrays: Dict[str, np.ndarray] = {}
+            raw_camera_meta: Dict[str, int] = {}
+            if raw_camera_clouds_local:
+                for camera_name, camera_clouds in sorted(raw_camera_clouds_local.items()):
+                    camera_points, camera_splits = pack_clouds(camera_clouds)
+                    extra_arrays[f"camera_{camera_name}_points_local"] = camera_points
+                    extra_arrays[f"camera_{camera_name}_splits"] = camera_splits
+                    raw_camera_meta[camera_name] = int(camera_points.shape[0])
 
             trajectory_name = f"trajectory_{trajectory_index:03d}"
             suffix = ".partial" if partial else ""
@@ -807,12 +1054,16 @@ def run_collection(args: argparse.Namespace) -> None:
                 measurement_splits=measurement_splits,
                 ground_truth_points=ground_truth_points,
                 ground_truth_splits=ground_truth_splits,
+                **extra_arrays,
             )
 
             trajectory_meta = {
                 "name": trajectory_name,
                 "partial": bool(partial),
                 "debug_camera": bool(args.debug_camera),
+                "camera_layout": args.camera_layout,
+                "trajectory_mode": args.trajectory_mode,
+                "save_raw_camera_clouds": bool(args.save_raw_camera_clouds),
                 "debug_file": f"{trajectory_name}{suffix}.debug.json" if args.debug_camera else None,
                 "timesteps": int(len(measurements_local)),
                 "completed_timesteps": int(len(measurements_local)),
@@ -832,7 +1083,16 @@ def run_collection(args: argparse.Namespace) -> None:
                 "ground_truth_points": int(ground_truth_points.shape[0]),
                 "measurement_points_per_timestep": [int(points.shape[0]) for points in measurements_local],
                 "ground_truth_points_per_timestep": [int(points.shape[0]) for points in ground_truth_local],
+                "visible_ground_truth_fraction_per_timestep": [float(value) for value in visible_ground_truth_fractions],
+                "visible_ground_truth_fraction_mean": (
+                    float(np.mean(visible_ground_truth_fractions)) if visible_ground_truth_fractions else 0.0
+                ),
+                "visibility_metric": {
+                    "type": "voxel_overlap_approximation",
+                    "voxel_size_m": float(args.ground_truth_spacing),
+                },
                 "all_measurements_empty": bool(measurement_points.shape[0] == 0),
+                "raw_camera_points": raw_camera_meta,
             }
             (args.output_dir / f"{trajectory_name}{suffix}.json").write_text(
                 json.dumps(trajectory_meta, indent=2),
@@ -927,6 +1187,7 @@ def run_collection(args: argparse.Namespace) -> None:
         stage = omni.usd.get_context().get_stage()
 
         camera_mounts = build_camera_mounts(args)
+        max_points_per_camera = max(1, int(math.ceil(args.max_measurement_points / max(1, len(camera_mounts)))))
         capture_substeps = max(1, int(round(args.capture_dt / args.physics_dt)))
         effective_capture_dt = capture_substeps * args.physics_dt
         camera_frequency_hz = max(1, int(round(1.0 / effective_capture_dt)))
@@ -1024,11 +1285,17 @@ def run_collection(args: argparse.Namespace) -> None:
                 scene=scene,
                 timesteps=args.timesteps,
                 nominal_base_height=args.nominal_base_height,
+                sample_dt=effective_capture_dt,
                 rng=rng,
+                args=args,
             )
 
             measurements_local: List[np.ndarray] = []
             ground_truth_local: List[np.ndarray] = []
+            visible_ground_truth_fractions: List[float] = []
+            raw_camera_clouds_local: Optional[Dict[str, List[np.ndarray]]] = (
+                {mount.name: [] for mount in camera_mounts} if args.save_raw_camera_clouds else None
+            )
             trajectory_debug_steps: List[Dict[str, object]] = []
 
             for step_index in range(args.timesteps):
@@ -1051,6 +1318,8 @@ def run_collection(args: argparse.Namespace) -> None:
                             scene=scene,
                             measurements_local=measurements_local,
                             ground_truth_local=ground_truth_local,
+                            visible_ground_truth_fractions=visible_ground_truth_fractions,
+                            raw_camera_clouds_local=raw_camera_clouds_local,
                             partial=True,
                         )
                         trajectories_meta.append(partial_meta)
@@ -1064,7 +1333,7 @@ def run_collection(args: argparse.Namespace) -> None:
                         debug_steps=trajectory_debug_steps,
                         partial=True,
                     )
-                    save_manifest(args.output_dir, args, robot_usd_path, trajectories_meta)
+                    save_manifest(args.output_dir, args, robot_usd_path, trajectories_meta, camera_mounts)
                     return
 
                 write_status(
@@ -1080,6 +1349,8 @@ def run_collection(args: argparse.Namespace) -> None:
                 step_render_frames(capture_substeps + (args.sensor_warmup_steps if step_index == 0 else 0))
 
                 measurement_world_chunks: List[np.ndarray] = []
+                world_to_robot = invert_transform(robot_pose)
+                timestep_camera_locals: Dict[str, np.ndarray] = {}
                 timestep_debug: Optional[Dict[str, object]] = None
                 if args.debug_camera:
                     timestep_debug = {
@@ -1136,14 +1407,22 @@ def run_collection(args: argparse.Namespace) -> None:
                         camera_debug["points_after_range_filter"] = int(points_world.shape[0])
                     if points_world.size == 0:
                         continue
-                    measurement_world_chunks.append(points_world.astype(np.float32, copy=False))
+                    points_world = points_world.astype(np.float32, copy=False)
+                    measurement_world_chunks.append(points_world)
+                    if raw_camera_clouds_local is not None:
+                        timestep_camera_locals[camera_name] = crop_local_points(
+                            transform_points(points_world, world_to_robot),
+                            GRID_BOUNDS_MIN,
+                            GRID_BOUNDS_MAX,
+                            max_points_per_camera,
+                            rng,
+                        )
 
                 measurement_world = (
                     np.concatenate(measurement_world_chunks, axis=0)
                     if measurement_world_chunks
                     else np.empty((0, 3), dtype=np.float32)
                 )
-                world_to_robot = invert_transform(robot_pose)
                 measurement_local = crop_local_points(
                     transform_points(measurement_world, world_to_robot),
                     GRID_BOUNDS_MIN,
@@ -1160,10 +1439,24 @@ def run_collection(args: argparse.Namespace) -> None:
                 )
                 measurements_local.append(measurement_local)
                 ground_truth_local.append(ground_truth_step_local)
+                visible_ground_truth_fraction = estimate_visible_ground_truth_fraction(
+                    ground_truth_step_local,
+                    measurement_local,
+                    voxel_size=args.ground_truth_spacing,
+                    origin=GRID_BOUNDS_MIN,
+                )
+                visible_ground_truth_fractions.append(visible_ground_truth_fraction)
+                if raw_camera_clouds_local is not None:
+                    empty_local = np.empty((0, 3), dtype=np.float32)
+                    for camera_name in raw_camera_clouds_local:
+                        raw_camera_clouds_local[camera_name].append(
+                            timestep_camera_locals.get(camera_name, empty_local)
+                        )
                 if timestep_debug is not None:
                     timestep_debug["measurement_world_point_count"] = int(measurement_world.shape[0])
                     timestep_debug["measurement_local_point_count"] = int(measurement_local.shape[0])
                     timestep_debug["ground_truth_local_point_count"] = int(ground_truth_step_local.shape[0])
+                    timestep_debug["visible_ground_truth_fraction"] = float(visible_ground_truth_fraction)
                     trajectory_debug_steps.append(timestep_debug)
 
             write_status("running", stage="saving", trajectory_index=int(trajectory_index))
@@ -1173,6 +1466,8 @@ def run_collection(args: argparse.Namespace) -> None:
                 scene=scene,
                 measurements_local=measurements_local,
                 ground_truth_local=ground_truth_local,
+                visible_ground_truth_fractions=visible_ground_truth_fractions,
+                raw_camera_clouds_local=raw_camera_clouds_local,
                 partial=False,
             )
             save_debug_artifacts(
@@ -1191,11 +1486,12 @@ def run_collection(args: argparse.Namespace) -> None:
                 f"[{trajectory_index + 1}/{args.num_trajectories}] "
                 f"saved {trajectory_meta['name']}.npz "
                 f"(measurement={trajectory_meta['measurement_points']}, "
-                f"gt={trajectory_meta['ground_truth_points']})",
+                f"gt={trajectory_meta['ground_truth_points']}, "
+                f"visible_gt_mean={trajectory_meta['visible_ground_truth_fraction_mean']:.3f})",
                 flush=True,
             )
 
-        save_manifest(args.output_dir, args, robot_usd_path, trajectories_meta)
+        save_manifest(args.output_dir, args, robot_usd_path, trajectories_meta, camera_mounts)
         write_status("completed", stage="done", trajectories_saved=len(trajectories_meta))
         print(f"Dataset collection completed: {args.output_dir}", flush=True)
     except BaseException as exc:
