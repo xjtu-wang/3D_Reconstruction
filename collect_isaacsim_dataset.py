@@ -82,15 +82,93 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--show-robot", action="store_true", help="Keep the robot visible to the cameras.")
     parser.add_argument("--asset-root", type=str, default=None, help="Override Isaac Sim assets root.")
     parser.add_argument("--robot-usd", type=str, default=None, help="Explicit ANYmal C USD path.")
+    parser.add_argument(
+        "--motion-source",
+        type=str,
+        choices=("policy_rollout", "velocity_fallback"),
+        default="policy_rollout",
+        help=(
+            "Robot motion source. 'policy_rollout' uses an Isaac Lab ANYmal rough-terrain policy on a USD terrain scene. "
+            "'velocity_fallback' keeps the legacy kinematic reachable-trajectory baseline."
+        ),
+    )
+    parser.add_argument(
+        "--policy-task",
+        type=str,
+        default="Isaac-Velocity-Rough-Anymal-C-v0",
+        help="Isaac Lab task identifier for metadata and validation when --motion-source policy_rollout is used.",
+    )
+    parser.add_argument(
+        "--policy-checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Path to an exported TorchScript/JIT policy checkpoint for Isaac Lab policy rollout. "
+            "Required when --motion-source policy_rollout is used."
+        ),
+    )
+    parser.add_argument(
+        "--policy-device",
+        type=str,
+        default="cuda:0",
+        help="Torch / Isaac Lab device used for policy inference, for example 'cuda:0' or 'cpu'.",
+    )
+    parser.add_argument(
+        "--policy-heading-range-deg",
+        type=float,
+        nargs=2,
+        default=(-180.0, 180.0),
+        metavar=("MIN", "MAX"),
+        help=(
+            "Absolute heading range in degrees for sampled high-level policy commands. "
+            "Used only when --motion-source policy_rollout is active."
+        ),
+    )
     parser.add_argument("--camera-width", type=int, default=1280)
     parser.add_argument("--camera-height", type=int, default=800)
+    parser.add_argument(
+        "--camera-pixel-stride",
+        type=int,
+        default=4,
+        help=(
+            "Stride used when sampling pixels from the camera depth image before back-projection. "
+            "Using a stride reduces redundant neighboring pixels that collapse into the same local voxels."
+        ),
+    )
     parser.add_argument("--physics-dt", type=float, default=1.0 / 60.0)
     parser.add_argument("--capture-dt", type=float, default=0.10)
     parser.add_argument("--path-length", type=float, default=8.0)
     parser.add_argument("--nominal-base-height", type=float, default=DEFAULT_BODY_HEIGHT)
     parser.add_argument("--ground-truth-spacing", type=float, default=0.05)
     parser.add_argument("--max-measurement-points", type=int, default=20000)
+    parser.add_argument(
+        "--max-camera-points",
+        type=int,
+        default=65536,
+        help=(
+            "Maximum number of depth pixels to back-project per camera after applying --camera-pixel-stride. "
+            "This is separate from the final fused measurement cap."
+        ),
+    )
     parser.add_argument("--max-ground-truth-points", type=int, default=40000)
+    parser.add_argument(
+        "--measurement-voxel-size",
+        type=float,
+        default=0.02,
+        help=(
+            "Robot-local voxel size for centroid downsampling of the fused measurement cloud before saving. "
+            "This removes heavy pixel-level duplication while preserving geometric coverage."
+        ),
+    )
+    parser.add_argument(
+        "--raw-camera-voxel-size",
+        type=float,
+        default=0.02,
+        help=(
+            "Robot-local voxel size for centroid downsampling of each individual camera cloud when "
+            "--save-raw-camera-clouds is enabled."
+        ),
+    )
     parser.add_argument("--camera-min-range", type=float, default=0.10)
     parser.add_argument("--camera-max-range", type=float, default=6.0)
     parser.add_argument(
@@ -111,47 +189,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-mount-x", type=float, default=0.34)
     parser.add_argument("--camera-mount-y", type=float, default=0.18)
     parser.add_argument(
-        "--camera-leg-z",
-        type=float,
-        default=-0.28,
-        help=(
-            "Approximate camera z-offset in the robot base frame when using --camera-layout leg_proxy. "
-            "This is a fixed proxy for nominal leg-mounted cameras, not a true articulated leg attachment."
-        ),
-    )
-    parser.add_argument(
         "--camera-down-tilt-deg",
         type=float,
         default=30.0,
         help="Paper-faithful default: 30 degrees downward tilt.",
     )
     parser.add_argument(
-        "--camera-layout",
-        type=str,
-        choices=("paper_cross", "leg_proxy"),
-        default="paper_cross",
-        help=(
-            "Camera rig layout. "
-            "'paper_cross' matches the current paper-style front/back/left/right layout. "
-            "'leg_proxy' approximates one camera near each leg corner, fixed in the base frame."
-        ),
-    )
-    parser.add_argument(
-        "--trajectory-mode",
-        type=str,
-        choices=("sinusoid", "velocity_command"),
-        default="sinusoid",
-        help=(
-            "Base-trajectory generator. "
-            "'sinusoid' keeps the original scene sweep. "
-            "'velocity_command' integrates random commanded body velocities to better mimic locomotion rollout data."
-        ),
-    )
-    parser.add_argument(
         "--command-resample-steps",
         type=int,
         default=8,
-        help="Steps between velocity-command resampling when --trajectory-mode velocity_command is used.",
+        help=(
+            "Saved-timestep interval between resampling high-level motion commands. "
+            "Used by both policy_rollout command injection and velocity_fallback trajectory generation."
+        ),
     )
     parser.add_argument(
         "--command-lin-vel-x-range",
@@ -159,7 +209,7 @@ def parse_args() -> argparse.Namespace:
         nargs=2,
         default=(0.30, 1.00),
         metavar=("MIN", "MAX"),
-        help="Sampled body-frame forward-velocity range in m/s for --trajectory-mode velocity_command.",
+        help="Sampled forward-velocity range in m/s for motion-command generation.",
     )
     parser.add_argument(
         "--command-lin-vel-y-range",
@@ -167,7 +217,7 @@ def parse_args() -> argparse.Namespace:
         nargs=2,
         default=(-0.20, 0.20),
         metavar=("MIN", "MAX"),
-        help="Sampled body-frame lateral-velocity range in m/s for --trajectory-mode velocity_command.",
+        help="Sampled lateral-velocity range in m/s for motion-command generation.",
     )
     parser.add_argument(
         "--command-yaw-rate-range-deg",
@@ -175,7 +225,7 @@ def parse_args() -> argparse.Namespace:
         nargs=2,
         default=(-20.0, 20.0),
         metavar=("MIN", "MAX"),
-        help="Sampled yaw-rate range in deg/s for --trajectory-mode velocity_command.",
+        help="Sampled yaw-rate range in deg/s for velocity_fallback trajectory generation.",
     )
     parser.add_argument(
         "--save-raw-camera-clouds",
@@ -190,12 +240,89 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Write detailed per-camera diagnostics for each timestep to trajectory_XXX.debug.json.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--trajectory-mode",
+        type=str,
+        choices=("sinusoid", "velocity_command"),
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--camera-layout",
+        type=str,
+        choices=("paper_cross", "leg_proxy"),
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--ground-truth-mode",
+        type=str,
+        choices=("raycast", "analytic_surface"),
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--camera-leg-z", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--ground-truth-raycast-start-z", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--ground-truth-raycast-length", type=float, default=None, help=argparse.SUPPRESS)
+
+    args = parser.parse_args()
+
+    if args.trajectory_mode is not None:
+        if args.trajectory_mode != "velocity_command":
+            raise SystemExit(
+                "Legacy --trajectory-mode sinusoid has been removed. "
+                "Use the paper-faithful default --motion-source policy_rollout or the explicit --motion-source velocity_fallback."
+            )
+        args.motion_source = "velocity_fallback"
+
+    if args.camera_layout not in (None, "paper_cross"):
+        raise SystemExit(
+            "Legacy --camera-layout leg_proxy has been removed from the paper-faithful collector. "
+            "Use the fixed front/back/left/right ANYmal C camera rig."
+        )
+
+    if args.camera_leg_z is not None:
+        raise SystemExit("Legacy --camera-leg-z is no longer supported by the paper-faithful collector.")
+
+    if args.ground_truth_mode is not None:
+        raise SystemExit(
+            "Legacy --ground-truth-mode is no longer supported. "
+            "Ground-truth point clouds are always sampled densely from the simulator scene mesh."
+        )
+
+    if args.ground_truth_raycast_start_z is not None or args.ground_truth_raycast_length is not None:
+        raise SystemExit("Legacy raycast ground-truth options are no longer supported.")
+
+    if args.motion_source == "policy_rollout" and not args.policy_checkpoint:
+        raise SystemExit(
+            "--policy-checkpoint is required when --motion-source policy_rollout is used. "
+            "Pass an exported Isaac Lab TorchScript/JIT policy checkpoint."
+        )
+
+    if not math.isclose(float(args.camera_down_tilt_deg), 30.0, rel_tol=0.0, abs_tol=1e-6):
+        raise SystemExit(
+            "The paper-faithful collector fixes the camera tilt at 30 degrees. "
+            "Remove --camera-down-tilt-deg or set it to 30."
+        )
+
+    if "Anymal-C" not in args.policy_task and "Anymal_C" not in args.policy_task and "Anymal" not in args.policy_task:
+        raise SystemExit(
+            "--policy-task must target the ANYmal C rough-terrain locomotion policy for this collector."
+        )
+
+    return args
 
 
 def sample_axis(extent: float, spacing: float) -> np.ndarray:
     count = max(int(math.floor((2.0 * extent) / spacing)) + 1, 2)
     return np.linspace(-extent, extent, count, dtype=np.float32)
+
+
+def sample_axis_from_bounds(min_value: float, max_value: float, spacing: float) -> np.ndarray:
+    if spacing <= 0.0:
+        raise ValueError("spacing must be positive")
+    count = max(int(math.floor((max_value - min_value) / spacing)) + 1, 2)
+    return np.linspace(min_value, max_value, count, dtype=np.float32)
 
 
 def normalize(vector: np.ndarray) -> np.ndarray:
@@ -341,6 +468,41 @@ def _unique_row_view(array: np.ndarray) -> np.ndarray:
     return contiguous.view(np.dtype((np.void, contiguous.dtype.itemsize * contiguous.shape[1])))
 
 
+def build_ground_truth_grid_local_xy(spacing: float) -> np.ndarray:
+    xs = sample_axis_from_bounds(float(GRID_BOUNDS_MIN[0]), float(GRID_BOUNDS_MAX[0]), spacing)
+    ys = sample_axis_from_bounds(float(GRID_BOUNDS_MIN[1]), float(GRID_BOUNDS_MAX[1]), spacing)
+    grid = np.stack(np.meshgrid(xs, ys, indexing="xy"), axis=-1).reshape(-1, 2)
+    return grid.astype(np.float32, copy=False)
+
+
+def voxel_downsample_centroids(
+    points: np.ndarray,
+    voxel_size: float,
+    max_points: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    if points.size == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    if voxel_size <= 0.0:
+        if points.shape[0] > max_points:
+            indices = rng.choice(points.shape[0], size=max_points, replace=False)
+            return points[indices].astype(np.float32, copy=False)
+        return points.astype(np.float32, copy=False)
+
+    voxel_indices = np.floor(points.astype(np.float32) / voxel_size).astype(np.int32)
+    unique_voxels, inverse_indices = np.unique(voxel_indices, axis=0, return_inverse=True)
+    centroids = np.zeros((unique_voxels.shape[0], 3), dtype=np.float32)
+    counts = np.zeros((unique_voxels.shape[0], 1), dtype=np.float32)
+    np.add.at(centroids, inverse_indices, points.astype(np.float32, copy=False))
+    np.add.at(counts, inverse_indices, 1.0)
+    centroids /= np.maximum(counts, 1.0)
+
+    if centroids.shape[0] > max_points:
+        indices = rng.choice(centroids.shape[0], size=max_points, replace=False)
+        centroids = centroids[indices]
+    return centroids.astype(np.float32, copy=False)
+
+
 def estimate_visible_ground_truth_fraction(
     ground_truth_local: np.ndarray,
     measurement_local: np.ndarray,
@@ -367,39 +529,6 @@ def build_camera_mounts(args: argparse.Namespace) -> Tuple[CameraMount, ...]:
     tilt = math.radians(args.camera_down_tilt_deg)
     forward_component = math.cos(tilt)
     down_component = math.sin(tilt)
-    if args.camera_layout == "leg_proxy":
-        diagonal_component = forward_component / math.sqrt(2.0)
-        return (
-            CameraMount(
-                name="front_left",
-                translation_in_base=np.array([args.camera_mount_x, args.camera_mount_y, args.camera_leg_z], dtype=np.float32),
-                forward_in_base=normalize(
-                    np.array([diagonal_component, diagonal_component, -down_component], dtype=np.float32)
-                ),
-            ),
-            CameraMount(
-                name="front_right",
-                translation_in_base=np.array([args.camera_mount_x, -args.camera_mount_y, args.camera_leg_z], dtype=np.float32),
-                forward_in_base=normalize(
-                    np.array([diagonal_component, -diagonal_component, -down_component], dtype=np.float32)
-                ),
-            ),
-            CameraMount(
-                name="rear_left",
-                translation_in_base=np.array([-args.camera_mount_x, args.camera_mount_y, args.camera_leg_z], dtype=np.float32),
-                forward_in_base=normalize(
-                    np.array([-diagonal_component, diagonal_component, -down_component], dtype=np.float32)
-                ),
-            ),
-            CameraMount(
-                name="rear_right",
-                translation_in_base=np.array([-args.camera_mount_x, -args.camera_mount_y, args.camera_leg_z], dtype=np.float32),
-                forward_in_base=normalize(
-                    np.array([-diagonal_component, -diagonal_component, -down_component], dtype=np.float32)
-                ),
-            ),
-        )
-
     return (
         CameraMount(
             name="front",
@@ -702,20 +831,13 @@ def generate_robot_poses(
     rng: np.random.Generator,
     args: argparse.Namespace,
 ) -> np.ndarray:
-    if args.trajectory_mode == "velocity_command":
-        return generate_velocity_command_robot_poses(
-            scene=scene,
-            timesteps=timesteps,
-            nominal_base_height=nominal_base_height,
-            sample_dt=sample_dt,
-            rng=rng,
-            args=args,
-        )
-    return generate_sinusoid_robot_poses(
+    return generate_velocity_command_robot_poses(
         scene=scene,
         timesteps=timesteps,
         nominal_base_height=nominal_base_height,
+        sample_dt=sample_dt,
         rng=rng,
+        args=args,
     )
 
 
@@ -741,14 +863,30 @@ def save_manifest(
             },
             "sensor": {
                 "cameras": [mount.name for mount in camera_mounts],
-                "layout": args.camera_layout,
+                "layout": "paper_cross",
                 "tilt_deg": args.camera_down_tilt_deg,
                 "resolution": [args.camera_width, args.camera_height],
+            },
+            "motion": {
+                "source": args.motion_source,
+                "policy_task": args.policy_task,
+            },
+            "ground_truth": {
+                "source": "sim_mesh_dense_sampling",
             },
         },
         "collector_args": {
             key: (str(value) if isinstance(value, Path) else value)
             for key, value in vars(args).items()
+            if key
+            not in {
+                "trajectory_mode",
+                "camera_layout",
+                "ground_truth_mode",
+                "camera_leg_z",
+                "ground_truth_raycast_start_z",
+                "ground_truth_raycast_length",
+            }
         },
         "robot_usd": robot_usd_path,
         "trajectories": trajectories,
@@ -769,6 +907,7 @@ def run_collection(args: argparse.Namespace) -> None:
             "debug_camera": bool(args.debug_camera),
             "num_trajectories": int(args.num_trajectories),
             "timesteps": int(args.timesteps),
+            "motion_source": args.motion_source,
         }
         payload.update(extra)
         status_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -784,15 +923,17 @@ def run_collection(args: argparse.Namespace) -> None:
         from isaacsim import SimulationApp
 
         simulation_app = SimulationApp({"headless": not args.show_ui})
+        import io
         import omni.client
         import omni.usd
         from isaacsim.core.api import World
-        from isaacsim.core.api.objects import FixedCuboid
         from isaacsim.core.prims import SingleArticulation
         from isaacsim.core.utils.prims import create_prim, delete_prim
         from isaacsim.core.utils.stage import add_reference_to_stage
         from isaacsim.sensors.camera import Camera
         from isaacsim.storage.native import get_assets_root_path
+        from pxr import Gf, Usd, UsdGeom, UsdPhysics
+        import torch
 
         rng = np.random.default_rng(args.seed)
         write_status("running", stage="simulation_app_started")
@@ -826,9 +967,26 @@ def run_collection(args: argparse.Namespace) -> None:
                     return candidate
             raise FileNotFoundError("Failed to find ANYmal C. Checked:\n" + "\n".join(candidates))
 
-        def step_render_frames(step_count: int) -> None:
+        def delete_stage_roots(stage_paths: Sequence[str]) -> None:
+            stage = omni.usd.get_context().get_stage()
+            for prim_path in stage_paths:
+                prim = stage.GetPrimAtPath(prim_path)
+                if prim.IsValid():
+                    delete_prim(prim_path)
+
+        def render_frames(
+            step_count: int,
+            *,
+            world: Optional[World] = None,
+            render_fn=None,
+        ) -> None:
             for _ in range(max(0, step_count)):
-                world.step(render=True)
+                if world is not None:
+                    world.step(render=True)
+                elif render_fn is not None:
+                    render_fn()
+                elif hasattr(simulation_app, "update"):
+                    simulation_app.update()
 
         def camera_frame_dict(camera: Camera) -> Dict[str, object]:
             try:
@@ -876,18 +1034,33 @@ def run_collection(args: argparse.Namespace) -> None:
             valid_mask = np.isfinite(depth)
             valid_mask &= depth >= args.camera_min_range
             valid_mask &= depth <= args.camera_max_range
-            valid_pixels = np.argwhere(valid_mask)
+            full_valid_pixels = np.argwhere(valid_mask)
             if debug is not None:
                 debug["depth_present"] = True
                 debug["depth_shape"] = list(depth.shape)
-                debug["depth_valid_pixel_count"] = int(valid_pixels.shape[0])
+                debug["depth_valid_pixel_count"] = int(full_valid_pixels.shape[0])
+            if full_valid_pixels.size == 0:
+                return np.empty((0, 3), dtype=np.float32)
+
+            pixel_stride = max(1, int(args.camera_pixel_stride))
+            if pixel_stride > 1:
+                strided_valid_mask = valid_mask[::pixel_stride, ::pixel_stride]
+                strided_pixels = np.argwhere(strided_valid_mask)
+                valid_pixels = (strided_pixels * pixel_stride).astype(np.int32, copy=False)
+            else:
+                valid_pixels = full_valid_pixels
+            if debug is not None:
+                debug["camera_pixel_stride"] = int(pixel_stride)
+                debug["depth_valid_pixel_count_after_stride"] = int(valid_pixels.shape[0])
             if valid_pixels.size == 0:
                 return np.empty((0, 3), dtype=np.float32)
 
-            if valid_pixels.shape[0] > args.max_measurement_points:
-                indices = rng.choice(valid_pixels.shape[0], size=args.max_measurement_points, replace=False)
+            max_camera_points = max(1, int(args.max_camera_points))
+            if valid_pixels.shape[0] > max_camera_points:
+                indices = np.linspace(0, valid_pixels.shape[0] - 1, max_camera_points, dtype=np.int32)
                 valid_pixels = valid_pixels[indices]
             if debug is not None:
+                debug["max_camera_points"] = max_camera_points
                 debug["depth_sampled_pixel_count"] = int(valid_pixels.shape[0])
 
             pixel_coords = np.column_stack((valid_pixels[:, 1], valid_pixels[:, 0])).astype(np.float32, copy=False)
@@ -927,9 +1100,6 @@ def run_collection(args: argparse.Namespace) -> None:
         def optical_camera_points_to_world(points_camera: np.ndarray, camera: Camera) -> np.ndarray:
             if points_camera.size == 0:
                 return np.empty((0, 3), dtype=np.float32)
-            # Isaac Sim get_pointcloud() returns optical camera coordinates:
-            # +X right, +Y down, +Z forward. get_world_pose(camera_axes="world")
-            # uses +X forward, +Y left, +Z up. Convert before applying the pose.
             points_world_axes_local = np.column_stack(
                 (
                     points_camera[:, 2],
@@ -988,7 +1158,7 @@ def run_collection(args: argparse.Namespace) -> None:
 
             return np.empty((0, 3), dtype=np.float32)
 
-        def capture_camera_points_world(camera: Camera, debug: Optional[Dict[str, object]] = None) -> np.ndarray:
+        def capture_camera_points_world(camera: Camera, *, render_retry_fn, debug: Optional[Dict[str, object]] = None) -> np.ndarray:
             attempt_summaries: List[Dict[str, object]] = []
             for attempt_index in range(args.sensor_retry_steps + 1):
                 attempt_debug: Dict[str, object] = {"attempt_index": int(attempt_index)}
@@ -1000,17 +1170,58 @@ def run_collection(args: argparse.Namespace) -> None:
                         debug["attempts"] = attempt_summaries
                         debug["selected_attempt"] = int(attempt_index)
                     return points_world.astype(np.float32, copy=False)
-                step_render_frames(1)
+                render_retry_fn(1)
             if debug is not None:
                 debug["attempts"] = attempt_summaries
             return np.empty((0, 3), dtype=np.float32)
 
-        def apply_robot_and_camera_pose(robot_pose: np.ndarray, robot: SingleArticulation, cameras: Dict[str, Camera]) -> None:
+        def create_cameras(*, capture_dt_effective: float, camera_mounts: Sequence[CameraMount]) -> Tuple[Dict[str, Camera], int]:
+            camera_frequency_hz = max(1, int(round(1.0 / capture_dt_effective)))
+            cameras: Dict[str, Camera] = {}
+            for mount in camera_mounts:
+                camera = Camera(
+                    prim_path=f"/World/Sensors/{mount.name}",
+                    name=f"{mount.name}_depth",
+                    frequency=camera_frequency_hz,
+                    resolution=(args.camera_width, args.camera_height),
+                    position=np.array([0.0, 0.0, 2.0], dtype=np.float32),
+                    orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                )
+                camera.initialize()
+                dt_configured = False
+                if hasattr(camera, "set_dt"):
+                    try:
+                        camera.set_dt(float(capture_dt_effective))
+                        dt_configured = True
+                    except Exception as exc:
+                        print(
+                            f"[collector] camera.set_dt({capture_dt_effective:.9f}) failed for "
+                            f"{camera.prim_path}: {exc}; falling back to set_frequency({camera_frequency_hz})",
+                            flush=True,
+                        )
+                if (not dt_configured) and hasattr(camera, "set_frequency"):
+                    camera.set_frequency(camera_frequency_hz)
+                if hasattr(camera, "set_clipping_range"):
+                    camera.set_clipping_range(args.camera_min_range, args.camera_max_range)
+                camera.add_distance_to_image_plane_to_frame()
+                camera.add_pointcloud_to_frame(include_unlabelled=True)
+                if hasattr(camera, "resume"):
+                    camera.resume()
+                cameras[mount.name] = camera
+            return cameras, camera_frequency_hz
+
+        def apply_robot_and_camera_pose(
+            robot_pose: np.ndarray,
+            robot: Optional[SingleArticulation],
+            cameras: Dict[str, Camera],
+            camera_mounts: Sequence[CameraMount],
+        ) -> None:
             robot_position = robot_pose[:3, 3].astype(np.float32, copy=False)
             robot_orientation = rotation_matrix_to_quaternion(robot_pose[:3, :3])
-            robot.set_world_pose(position=robot_position, orientation=robot_orientation)
-            if hasattr(robot, "set_world_velocity"):
-                robot.set_world_velocity(np.zeros(6, dtype=np.float32))
+            if robot is not None:
+                robot.set_world_pose(position=robot_position, orientation=robot_orientation)
+                if hasattr(robot, "set_world_velocity"):
+                    robot.set_world_velocity(np.zeros(6, dtype=np.float32))
 
             base_rotation = robot_pose[:3, :3]
             for mount in camera_mounts:
@@ -1023,11 +1234,343 @@ def run_collection(args: argparse.Namespace) -> None:
                     camera_axes="world",
                 )
 
+        def sanitize_prim_name(name: str) -> str:
+            sanitized = "".join(character if (character.isalnum() or character == "_") else "_" for character in name)
+            return sanitized or "prim"
+
+        def author_scene_usd(scene: SceneDescription, usd_path: Path) -> None:
+            usd_path.parent.mkdir(parents=True, exist_ok=True)
+            stage = Usd.Stage.CreateNew(str(usd_path))
+            if stage is None:
+                raise RuntimeError(f"Failed to create USD stage: {usd_path}")
+            UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+            UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+            root = UsdGeom.Xform.Define(stage, "/Scene")
+            stage.SetDefaultPrim(root.GetPrim())
+            world_boxes = [world_box_from_local(box, scene.scene_yaw_radians) for box in scene.boxes_local]
+            for box in world_boxes:
+                cube = UsdGeom.Cube.Define(stage, f"/Scene/{sanitize_prim_name(box.name)}")
+                cube.CreateSizeAttr(2.0)
+                translate_op = cube.AddTranslateOp()
+                orient_op = cube.AddOrientOp()
+                scale_op = cube.AddScaleOp()
+                translate_op.Set(Gf.Vec3d(float(box.center[0]), float(box.center[1]), float(box.center[2])))
+                box_quaternion = rotation_matrix_to_quaternion(yaw_rotation_matrix(box.yaw_radians))
+                orient_op.Set(
+                    Gf.Quatf(
+                        float(box_quaternion[0]),
+                        Gf.Vec3f(float(box_quaternion[1]), float(box_quaternion[2]), float(box_quaternion[3])),
+                    )
+                )
+                scale_op.Set(Gf.Vec3f(float(box.size[0] * 0.5), float(box.size[1] * 0.5), float(box.size[2] * 0.5)))
+                UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+                cube.GetDisplayColorAttr().Set([Gf.Vec3f(0.45, 0.45, 0.45)])
+            stage.GetRootLayer().Save()
+
+        def triangulate_scene_mesh(root_prim_path: str) -> np.ndarray:
+            stage = omni.usd.get_context().get_stage()
+            root_prim = stage.GetPrimAtPath(root_prim_path)
+            if not root_prim.IsValid():
+                raise RuntimeError(f"Ground-truth mesh root prim does not exist: {root_prim_path}")
+
+            xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+            triangles: List[np.ndarray] = []
+
+            def transform_point(matrix: Gf.Matrix4d, point: Sequence[float]) -> np.ndarray:
+                transformed = matrix.Transform(Gf.Vec3d(float(point[0]), float(point[1]), float(point[2])))
+                return np.array([float(transformed[0]), float(transformed[1]), float(transformed[2])], dtype=np.float32)
+
+            def cube_triangles(cube_prim: Usd.Prim) -> List[np.ndarray]:
+                cube = UsdGeom.Cube(cube_prim)
+                size_attr = cube.GetSizeAttr().Get()
+                edge = float(size_attr) if size_attr is not None else 2.0
+                half = 0.5 * edge
+                local_vertices = np.array(
+                    [
+                        [-half, -half, -half],
+                        [half, -half, -half],
+                        [half, half, -half],
+                        [-half, half, -half],
+                        [-half, -half, half],
+                        [half, -half, half],
+                        [half, half, half],
+                        [-half, half, half],
+                    ],
+                    dtype=np.float32,
+                )
+                matrix = xform_cache.GetLocalToWorldTransform(cube_prim)
+                world_vertices = np.stack([transform_point(matrix, vertex) for vertex in local_vertices], axis=0)
+                triangle_indices = (
+                    (0, 1, 2), (0, 2, 3),
+                    (4, 6, 5), (4, 7, 6),
+                    (0, 4, 5), (0, 5, 1),
+                    (1, 5, 6), (1, 6, 2),
+                    (2, 6, 7), (2, 7, 3),
+                    (3, 7, 4), (3, 4, 0),
+                )
+                return [world_vertices[np.asarray(indices, dtype=np.int32)] for indices in triangle_indices]
+
+            def mesh_triangles(mesh_prim: Usd.Prim) -> List[np.ndarray]:
+                mesh = UsdGeom.Mesh(mesh_prim)
+                points_attr = mesh.GetPointsAttr().Get()
+                face_counts = mesh.GetFaceVertexCountsAttr().Get()
+                face_indices = mesh.GetFaceVertexIndicesAttr().Get()
+                if points_attr is None or face_counts is None or face_indices is None:
+                    raise RuntimeError(f"Mesh prim is missing topology data: {mesh_prim.GetPath()}")
+                matrix = xform_cache.GetLocalToWorldTransform(mesh_prim)
+                world_vertices = np.stack([transform_point(matrix, point) for point in points_attr], axis=0)
+                triangles_local: List[np.ndarray] = []
+                cursor = 0
+                for face_vertex_count in face_counts:
+                    count = int(face_vertex_count)
+                    face = [int(index) for index in face_indices[cursor : cursor + count]]
+                    cursor += count
+                    if count < 3:
+                        continue
+                    for index in range(1, count - 1):
+                        triangles_local.append(
+                            world_vertices[np.asarray([face[0], face[index], face[index + 1]], dtype=np.int32)].astype(np.float32, copy=False)
+                        )
+                return triangles_local
+
+            for prim in Usd.PrimRange(root_prim):
+                if not prim.IsValid() or not prim.IsActive():
+                    continue
+                imageable = UsdGeom.Imageable(prim)
+                if imageable.GetPrim().IsValid():
+                    visibility = imageable.ComputeVisibility(Usd.TimeCode.Default())
+                    if visibility == UsdGeom.Tokens.invisible:
+                        continue
+
+                if prim.IsA(UsdGeom.Cube):
+                    triangles.extend(cube_triangles(prim))
+                    continue
+                if prim.IsA(UsdGeom.Mesh):
+                    triangles.extend(mesh_triangles(prim))
+                    continue
+                if prim.IsA(UsdGeom.Gprim):
+                    raise RuntimeError(
+                        f"Unsupported visible geometry for mesh ground truth: {prim.GetPath()} ({prim.GetTypeName()})"
+                    )
+
+            if not triangles:
+                raise RuntimeError(f"No triangulated geometry found below {root_prim_path}")
+            return np.stack(triangles, axis=0).astype(np.float32, copy=False)
+
+        def build_scene_mesh_ground_truth_world(root_prim_path: str) -> np.ndarray:
+            triangles = triangulate_scene_mesh(root_prim_path)
+            spacing = float(args.ground_truth_spacing)
+            area_per_sample = max(0.5 * spacing * spacing, 1e-6)
+            dense_samples: List[np.ndarray] = []
+            for triangle in triangles:
+                v0, v1, v2 = triangle
+                area = 0.5 * float(np.linalg.norm(np.cross(v1 - v0, v2 - v0)))
+                sample_count = max(1, int(math.ceil(area / area_per_sample)))
+                random_u = rng.random(sample_count, dtype=np.float32)
+                random_v = rng.random(sample_count, dtype=np.float32)
+                sqrt_u = np.sqrt(random_u)
+                bary_a = 1.0 - sqrt_u
+                bary_b = sqrt_u * (1.0 - random_v)
+                bary_c = sqrt_u * random_v
+                sampled = (
+                    bary_a[:, None] * v0[None, :]
+                    + bary_b[:, None] * v1[None, :]
+                    + bary_c[:, None] * v2[None, :]
+                ).astype(np.float32, copy=False)
+                dense_samples.append(
+                    np.concatenate(
+                        (
+                            sampled,
+                            np.stack((v0, v1, v2, (v0 + v1 + v2) / 3.0), axis=0).astype(np.float32, copy=False),
+                        ),
+                        axis=0,
+                    )
+                )
+
+            dense_world = np.concatenate(dense_samples, axis=0) if dense_samples else np.empty((0, 3), dtype=np.float32)
+            return voxel_downsample_centroids(
+                dense_world,
+                voxel_size=args.ground_truth_spacing * 0.5,
+                max_points=max(dense_world.shape[0], args.max_ground_truth_points),
+                rng=rng,
+            )
+
+        def load_torchscript_policy(policy_path: str, device: str) -> torch.jit.ScriptModule:
+            if "://" in policy_path:
+                file_content = omni.client.read_file(policy_path)[2]
+                file_object = io.BytesIO(memoryview(file_content).tobytes())
+                policy = torch.jit.load(file_object, map_location=device)
+            else:
+                policy = torch.jit.load(str(Path(policy_path).expanduser().resolve()), map_location=device)
+            policy.eval()
+            return policy
+
+        def sample_policy_command_sequence(timesteps: int) -> np.ndarray:
+            lin_vel_x_range = sorted_pair(args.command_lin_vel_x_range)
+            lin_vel_y_range = sorted_pair(args.command_lin_vel_y_range)
+            heading_range_deg = sorted_pair(args.policy_heading_range_deg)
+            heading_range = tuple(math.radians(value) for value in heading_range_deg)
+            commands = np.zeros((timesteps, 4), dtype=np.float32)
+            current_command = np.zeros((4,), dtype=np.float32)
+            resample_steps = max(1, int(args.command_resample_steps))
+            for index in range(timesteps):
+                if index % resample_steps == 0:
+                    current_command[0] = float(rng.uniform(*lin_vel_x_range))
+                    current_command[1] = float(rng.uniform(*lin_vel_y_range))
+                    current_command[2] = 0.0
+                    current_command[3] = float(rng.uniform(*heading_range))
+                commands[index] = current_command
+            return commands.astype(np.float32, copy=False)
+
+        def policy_env_robot_pose(policy_env: object) -> np.ndarray:
+            robot_asset = policy_env.scene["robot"]
+            position = robot_asset.data.root_pos_w[0].detach().cpu().numpy().astype(np.float32)
+            quaternion = robot_asset.data.root_quat_w[0].detach().cpu().numpy().astype(np.float32)
+            return pose_matrix(position, quaternion_to_rotation_matrix(quaternion))
+
+        def capture_timestep_observation(
+            *,
+            step_index: int,
+            robot_pose: np.ndarray,
+            cameras: Dict[str, Camera],
+            gt_world_points: np.ndarray,
+            max_points_per_camera: int,
+            render_retry_fn,
+        ) -> Tuple[np.ndarray, np.ndarray, float, Dict[str, np.ndarray], Optional[Dict[str, object]]]:
+            measurement_world_chunks: List[np.ndarray] = []
+            world_to_robot = invert_transform(robot_pose)
+            timestep_camera_locals: Dict[str, np.ndarray] = {}
+            timestep_debug: Optional[Dict[str, object]] = None
+            if args.debug_camera:
+                timestep_debug = {
+                    "timestep_index": int(step_index),
+                    "motion_source": args.motion_source,
+                    "robot_position_world": robot_pose[:3, 3].astype(np.float32).tolist(),
+                    "robot_rotation_world": robot_pose[:3, :3].astype(np.float32).tolist(),
+                    "ground_truth_source": "sim_mesh_dense_sampling",
+                    "cameras": [],
+                }
+
+            for camera_name, camera in cameras.items():
+                camera_debug: Optional[Dict[str, object]] = None
+                if timestep_debug is not None:
+                    camera_pose_world = camera_transform_world(camera)
+                    camera_debug = {
+                        "name": camera_name,
+                        "prim_path": str(camera.prim_path),
+                        "position_world": camera_pose_world[:3, 3].astype(np.float32).tolist(),
+                        "forward_world": camera_pose_world[:3, 0].astype(np.float32).tolist(),
+                    }
+                    timestep_debug["cameras"].append(camera_debug)
+
+                points_world = capture_camera_points_world(camera, render_retry_fn=render_retry_fn, debug=camera_debug)
+                if camera_debug is not None:
+                    camera_debug["points_before_finite_filter"] = int(points_world.shape[0])
+                if points_world.size == 0:
+                    continue
+
+                finite_mask = np.isfinite(points_world).all(axis=1)
+                points_world = points_world[finite_mask]
+                if camera_debug is not None:
+                    camera_debug["points_after_finite_filter"] = int(points_world.shape[0])
+                if points_world.size == 0:
+                    continue
+
+                camera_position, _ = camera.get_world_pose(camera_axes="world")
+                distances = np.linalg.norm(points_world - np.asarray(camera_position, dtype=np.float32), axis=1)
+                range_mask = distances >= args.camera_min_range
+                range_mask &= distances <= args.camera_max_range
+                if camera_debug is not None and distances.size > 0:
+                    camera_debug["distance_stats_m"] = {
+                        "min": float(np.min(distances)),
+                        "max": float(np.max(distances)),
+                    }
+                points_world = points_world[range_mask]
+                if camera_debug is not None:
+                    camera_debug["points_after_range_filter"] = int(points_world.shape[0])
+                if points_world.size == 0:
+                    continue
+
+                points_world = points_world.astype(np.float32, copy=False)
+                measurement_world_chunks.append(points_world)
+                if args.save_raw_camera_clouds:
+                    camera_points_local = crop_local_points(
+                        transform_points(points_world, world_to_robot),
+                        GRID_BOUNDS_MIN,
+                        GRID_BOUNDS_MAX,
+                        max(args.max_camera_points, max_points_per_camera),
+                        rng,
+                    )
+                    timestep_camera_locals[camera_name] = voxel_downsample_centroids(
+                        camera_points_local,
+                        voxel_size=args.raw_camera_voxel_size,
+                        max_points=max_points_per_camera,
+                        rng=rng,
+                    )
+
+            measurement_world = (
+                np.concatenate(measurement_world_chunks, axis=0)
+                if measurement_world_chunks
+                else np.empty((0, 3), dtype=np.float32)
+            )
+            measurement_local = crop_local_points(
+                transform_points(measurement_world, world_to_robot),
+                GRID_BOUNDS_MIN,
+                GRID_BOUNDS_MAX,
+                args.max_measurement_points,
+                rng,
+            )
+            measurement_local = voxel_downsample_centroids(
+                measurement_local,
+                voxel_size=args.measurement_voxel_size,
+                max_points=args.max_measurement_points,
+                rng=rng,
+            )
+
+            ground_truth_step_local = crop_local_points(
+                transform_points(gt_world_points, world_to_robot),
+                GRID_BOUNDS_MIN,
+                GRID_BOUNDS_MAX,
+                args.max_ground_truth_points,
+                rng,
+            )
+            ground_truth_step_local = voxel_downsample_centroids(
+                ground_truth_step_local,
+                voxel_size=args.ground_truth_spacing,
+                max_points=args.max_ground_truth_points,
+                rng=rng,
+            )
+
+            visible_ground_truth_fraction = estimate_visible_ground_truth_fraction(
+                ground_truth_step_local,
+                measurement_local,
+                voxel_size=args.ground_truth_spacing,
+                origin=GRID_BOUNDS_MIN,
+            )
+
+            if timestep_debug is not None:
+                timestep_debug["measurement_world_point_count"] = int(measurement_world.shape[0])
+                timestep_debug["measurement_local_point_count"] = int(measurement_local.shape[0])
+                timestep_debug["ground_truth_local_point_count"] = int(ground_truth_step_local.shape[0])
+                timestep_debug["visible_ground_truth_fraction"] = float(visible_ground_truth_fraction)
+
+            return (
+                measurement_local,
+                ground_truth_step_local,
+                visible_ground_truth_fraction,
+                timestep_camera_locals,
+                timestep_debug,
+            )
+
         def save_trajectory_artifacts(
             *,
             trajectory_index: int,
             trajectory_poses: np.ndarray,
             scene: SceneDescription,
+            scene_usd_path: Path,
+            capture_step_count: int,
+            capture_dt_effective: float,
+            camera_frequency_hz: int,
             measurements_local: List[np.ndarray],
             ground_truth_local: List[np.ndarray],
             visible_ground_truth_fractions: List[float],
@@ -1061,13 +1604,20 @@ def run_collection(args: argparse.Namespace) -> None:
                 "name": trajectory_name,
                 "partial": bool(partial),
                 "debug_camera": bool(args.debug_camera),
-                "camera_layout": args.camera_layout,
-                "trajectory_mode": args.trajectory_mode,
+                "motion_source": args.motion_source,
+                "policy_task": args.policy_task if args.motion_source == "policy_rollout" else None,
+                "ground_truth_source": "sim_mesh_dense_sampling",
+                "camera_layout": "paper_cross",
                 "save_raw_camera_clouds": bool(args.save_raw_camera_clouds),
                 "debug_file": f"{trajectory_name}{suffix}.debug.json" if args.debug_camera else None,
+                "scene_usd": str(scene_usd_path),
                 "timesteps": int(len(measurements_local)),
                 "completed_timesteps": int(len(measurements_local)),
                 "requested_timesteps": int(args.timesteps),
+                "capture_step_count": int(capture_step_count),
+                "capture_dt_requested_s": float(args.capture_dt),
+                "capture_dt_effective_s": float(capture_dt_effective),
+                "camera_frequency_hz": int(camera_frequency_hz),
                 "path_length_m": scene.path_length,
                 "corridor_width_m": scene.corridor_width,
                 "scene_yaw_deg": math.degrees(scene.scene_yaw_radians),
@@ -1104,6 +1654,9 @@ def run_collection(args: argparse.Namespace) -> None:
             *,
             trajectory_index: int,
             scene: SceneDescription,
+            capture_step_count: int,
+            capture_dt_effective: float,
+            camera_frequency_hz: int,
             debug_steps: List[Dict[str, object]],
             partial: bool,
         ) -> None:
@@ -1117,10 +1670,12 @@ def run_collection(args: argparse.Namespace) -> None:
                 "requested_timesteps": int(args.timesteps),
                 "completed_timesteps": int(len(debug_steps)),
                 "camera_debug_enabled": True,
+                "motion_source": args.motion_source,
+                "ground_truth_source": "sim_mesh_dense_sampling",
                 "physics_dt": float(args.physics_dt),
                 "capture_dt_requested": float(args.capture_dt),
-                "capture_substeps": int(capture_substeps),
-                "capture_dt_effective": float(effective_capture_dt),
+                "capture_substeps": int(capture_step_count),
+                "capture_dt_effective": float(capture_dt_effective),
                 "camera_frequency_hz": int(camera_frequency_hz),
                 "sensor_warmup_steps": int(args.sensor_warmup_steps),
                 "sensor_retry_steps": int(args.sensor_retry_steps),
@@ -1147,7 +1702,6 @@ def run_collection(args: argparse.Namespace) -> None:
         def clear_world_instance(active_world: Optional[World], trajectory_index: int) -> None:
             if active_world is None:
                 return
-
             print(
                 f"[collector] clearing world instance before trajectory {trajectory_index + 1}/{args.num_trajectories}",
                 flush=True,
@@ -1180,24 +1734,27 @@ def run_collection(args: argparse.Namespace) -> None:
                 except Exception as exc:
                     print(f"[collector] clear_instance() failed: {exc}", flush=True)
 
-        robot_usd_path = resolve_robot_usd()
+        robot_usd_path = resolve_robot_usd() if args.motion_source == "velocity_fallback" else f"isaaclab::{args.policy_task}"
         write_status("running", stage="assets_resolved", robot_usd=robot_usd_path)
-        print(f"[collector] resolved robot usd: {robot_usd_path}", flush=True)
-        world: Optional[World] = None
-        stage = omni.usd.get_context().get_stage()
+        print(f"[collector] resolved robot source: {robot_usd_path}", flush=True)
 
         camera_mounts = build_camera_mounts(args)
         max_points_per_camera = max(1, int(math.ceil(args.max_measurement_points / max(1, len(camera_mounts)))))
-        capture_substeps = max(1, int(round(args.capture_dt / args.physics_dt)))
-        effective_capture_dt = capture_substeps * args.physics_dt
-        camera_frequency_hz = max(1, int(round(1.0 / effective_capture_dt)))
-        if not math.isclose(effective_capture_dt, args.capture_dt, rel_tol=0.0, abs_tol=1e-9):
+        fallback_capture_steps = max(1, int(round(args.capture_dt / args.physics_dt)))
+        fallback_capture_dt_effective = fallback_capture_steps * args.physics_dt
+        if not math.isclose(fallback_capture_dt_effective, args.capture_dt, rel_tol=0.0, abs_tol=1e-9):
             print(
                 f"[collector] adjusted capture_dt from {args.capture_dt:.9f}s "
-                f"to {effective_capture_dt:.9f}s to align with physics_dt={args.physics_dt:.9f}s",
+                f"to {fallback_capture_dt_effective:.9f}s to align with physics_dt={args.physics_dt:.9f}s",
                 flush=True,
             )
+
+        scene_usd_dir = args.output_dir / "_scene_usd"
+        scene_usd_dir.mkdir(parents=True, exist_ok=True)
+        policy_command_sequence = sample_policy_command_sequence(args.timesteps)
         trajectories_meta: List[Dict[str, object]] = []
+        world: Optional[World] = None
+        policy_env = None
 
         for trajectory_index in range(args.num_trajectories):
             write_status("running", stage="trajectory_setup", trajectory_index=int(trajectory_index))
@@ -1207,88 +1764,16 @@ def run_collection(args: argparse.Namespace) -> None:
             )
             clear_world_instance(world, trajectory_index)
             world = None
-            stage = omni.usd.get_context().get_stage()
-            for prim_path in ("/World/Scene", "/World/Sensors", "/World/Robot"):
-                prim = stage.GetPrimAtPath(prim_path)
-                if prim.IsValid():
-                    delete_prim(prim_path)
-
-            world = World(stage_units_in_meters=1.0, physics_dt=args.physics_dt, rendering_dt=args.physics_dt)
-            print(f"[collector] recreated world for trajectory {trajectory_index:03d}", flush=True)
-            stage = omni.usd.get_context().get_stage()
-            create_prim("/World/Scene", "Xform")
-            create_prim("/World/Sensors", "Xform")
+            if policy_env is not None:
+                close_method = getattr(policy_env, "close", None)
+                if callable(close_method):
+                    close_method()
+                policy_env = None
+            delete_stage_roots(("/World/Scene", "/World/Sensors", "/World/Robot", "/World/envs", "/World/ground"))
 
             scene = build_random_scene(rng, args)
-            gt_world_points = build_scene_ground_truth(scene, args.ground_truth_spacing)
-            world_boxes = [world_box_from_local(box, scene.scene_yaw_radians) for box in scene.boxes_local]
-
-            for box in world_boxes:
-                FixedCuboid(
-                    prim_path=f"/World/Scene/{box.name}",
-                    name=box.name,
-                    position=box.center.astype(np.float32),
-                    orientation=rotation_matrix_to_quaternion(yaw_rotation_matrix(box.yaw_radians)),
-                    scale=box.size.astype(np.float32),
-                    size=1.0,
-                    color=np.array([0.45, 0.45, 0.45], dtype=np.float32),
-                )
-
-            add_reference_to_stage(robot_usd_path, "/World/Robot")
-            robot = SingleArticulation(prim_path="/World/Robot", name=f"anymal_c_{trajectory_index:03d}")
-
-            cameras: Dict[str, Camera] = {}
-            for mount in camera_mounts:
-                camera = Camera(
-                    prim_path=f"/World/Sensors/{mount.name}",
-                    name=f"{mount.name}_depth",
-                    frequency=camera_frequency_hz,
-                    resolution=(args.camera_width, args.camera_height),
-                    position=np.array([0.0, 0.0, 2.0], dtype=np.float32),
-                    orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
-                )
-                cameras[mount.name] = camera
-
-            world.reset()
-            if hasattr(world, "play"):
-                world.play()
-            print(f"[collector] world reset complete for trajectory {trajectory_index:03d}", flush=True)
-            robot.initialize()
-            if hasattr(robot, "disable_gravity"):
-                robot.disable_gravity()
-            if (not args.show_robot) and (not args.show_ui) and hasattr(robot, "set_visibility"):
-                robot.set_visibility(False)
-            for camera in cameras.values():
-                camera.initialize()
-                dt_configured = False
-                if hasattr(camera, "set_dt"):
-                    try:
-                        camera.set_dt(effective_capture_dt)
-                        dt_configured = True
-                    except Exception as exc:
-                        print(
-                            f"[collector] camera.set_dt({effective_capture_dt:.9f}) failed for "
-                            f"{camera.prim_path}: {exc}; falling back to set_frequency({camera_frequency_hz})",
-                            flush=True,
-                        )
-                if (not dt_configured) and hasattr(camera, "set_frequency"):
-                    camera.set_frequency(camera_frequency_hz)
-                if hasattr(camera, "set_clipping_range"):
-                    camera.set_clipping_range(args.camera_min_range, args.camera_max_range)
-                camera.add_distance_to_image_plane_to_frame()
-                camera.add_pointcloud_to_frame(include_unlabelled=True)
-                if hasattr(camera, "resume"):
-                    camera.resume()
-            print(f"[collector] cameras initialized for trajectory {trajectory_index:03d}", flush=True)
-
-            trajectory_poses = generate_robot_poses(
-                scene=scene,
-                timesteps=args.timesteps,
-                nominal_base_height=args.nominal_base_height,
-                sample_dt=effective_capture_dt,
-                rng=rng,
-                args=args,
-            )
+            scene_usd_path = scene_usd_dir / f"scene_{trajectory_index:03d}.usd"
+            author_scene_usd(scene, scene_usd_path)
 
             measurements_local: List[np.ndarray] = []
             ground_truth_local: List[np.ndarray] = []
@@ -1297,173 +1782,250 @@ def run_collection(args: argparse.Namespace) -> None:
                 {mount.name: [] for mount in camera_mounts} if args.save_raw_camera_clouds else None
             )
             trajectory_debug_steps: List[Dict[str, object]] = []
+            collected_poses: List[np.ndarray] = []
+            capture_step_count = fallback_capture_steps
+            capture_dt_effective = fallback_capture_dt_effective
+            camera_frequency_hz = max(1, int(round(1.0 / capture_dt_effective)))
+            ui_interrupted = False
+            rollout_interrupted = False
 
-            for step_index in range(args.timesteps):
-                if hasattr(simulation_app, "is_running") and not simulation_app.is_running():
-                    print(
-                        f"[collector] ui requested shutdown before timestep {step_index} "
-                        f"of trajectory {trajectory_index:03d}",
-                        flush=True,
-                    )
+            if args.motion_source == "velocity_fallback":
+                world = World(stage_units_in_meters=1.0, physics_dt=args.physics_dt, rendering_dt=args.physics_dt)
+                print(f"[collector] recreated fallback world for trajectory {trajectory_index:03d}", flush=True)
+                create_prim("/World/Scene", "Xform")
+                create_prim("/World/Sensors", "Xform")
+                add_reference_to_stage(str(scene_usd_path), "/World/Scene")
+                add_reference_to_stage(robot_usd_path, "/World/Robot")
+                robot = SingleArticulation(prim_path="/World/Robot", name=f"anymal_c_{trajectory_index:03d}")
+                cameras, camera_frequency_hz = create_cameras(
+                    capture_dt_effective=capture_dt_effective,
+                    camera_mounts=camera_mounts,
+                )
+
+                world.reset()
+                if hasattr(world, "play"):
+                    world.play()
+                robot.initialize()
+                if hasattr(robot, "disable_gravity"):
+                    robot.disable_gravity()
+                if (not args.show_robot) and (not args.show_ui) and hasattr(robot, "set_visibility"):
+                    robot.set_visibility(False)
+                gt_world_points = build_scene_mesh_ground_truth_world("/World/Scene")
+                trajectory_poses = generate_robot_poses(
+                    scene=scene,
+                    timesteps=args.timesteps,
+                    nominal_base_height=args.nominal_base_height,
+                    sample_dt=capture_dt_effective,
+                    rng=rng,
+                    args=args,
+                )
+
+                for step_index in range(args.timesteps):
+                    if hasattr(simulation_app, "is_running") and not simulation_app.is_running():
+                        ui_interrupted = True
+                        break
                     write_status(
-                        "interrupted",
-                        stage="ui_shutdown",
+                        "running",
+                        stage="collecting",
                         trajectory_index=int(trajectory_index),
-                        completed_timesteps=int(len(measurements_local)),
+                        timestep_index=int(step_index),
                     )
-                    if measurements_local or ground_truth_local:
-                        partial_meta = save_trajectory_artifacts(
-                            trajectory_index=trajectory_index,
-                            trajectory_poses=trajectory_poses,
-                            scene=scene,
-                            measurements_local=measurements_local,
-                            ground_truth_local=ground_truth_local,
-                            visible_ground_truth_fractions=visible_ground_truth_fractions,
-                            raw_camera_clouds_local=raw_camera_clouds_local,
-                            partial=True,
-                        )
-                        trajectories_meta.append(partial_meta)
-                        print(
-                            f"[collector] saved partial trajectory_{trajectory_index:03d}.partial.npz",
-                            flush=True,
-                        )
-                    save_debug_artifacts(
+                    robot_pose = trajectory_poses[step_index]
+                    collected_poses.append(robot_pose.astype(np.float32, copy=True))
+                    apply_robot_and_camera_pose(robot_pose, robot, cameras, camera_mounts)
+                    render_frames(
+                        capture_step_count + (args.sensor_warmup_steps if step_index == 0 else 0),
+                        world=world,
+                    )
+                    measurement_local, ground_truth_step_local, visible_fraction, timestep_camera_locals, timestep_debug = capture_timestep_observation(
+                        step_index=step_index,
+                        robot_pose=robot_pose,
+                        cameras=cameras,
+                        gt_world_points=gt_world_points,
+                        max_points_per_camera=max_points_per_camera,
+                        render_retry_fn=lambda count: render_frames(count, world=world),
+                    )
+                    measurements_local.append(measurement_local)
+                    ground_truth_local.append(ground_truth_step_local)
+                    visible_ground_truth_fractions.append(visible_fraction)
+                    if raw_camera_clouds_local is not None:
+                        empty_local = np.empty((0, 3), dtype=np.float32)
+                        for camera_name in raw_camera_clouds_local:
+                            raw_camera_clouds_local[camera_name].append(timestep_camera_locals.get(camera_name, empty_local))
+                    if timestep_debug is not None:
+                        trajectory_debug_steps.append(timestep_debug)
+            else:
+                from isaaclab.envs import ManagerBasedRLEnv
+                from isaaclab.terrains import TerrainImporterCfg
+                from isaaclab_tasks.manager_based.locomotion.velocity.config.anymal_c.rough_env_cfg import AnymalCRoughEnvCfg_PLAY
+
+                env_cfg = AnymalCRoughEnvCfg_PLAY()
+                env_cfg.scene.num_envs = 1
+                env_cfg.scene.env_spacing = 2.5
+                env_cfg.episode_length_s = max(60.0, float(args.timesteps) * float(args.capture_dt) * 4.0)
+                env_cfg.curriculum = None
+                env_cfg.scene.terrain = TerrainImporterCfg(
+                    prim_path="/World/ground",
+                    terrain_type="usd",
+                    usd_path=str(scene_usd_path.resolve()),
+                )
+                env_cfg.sim.device = args.policy_device
+                if str(args.policy_device).startswith("cpu"):
+                    env_cfg.sim.use_fabric = False
+
+                policy_env = ManagerBasedRLEnv(cfg=env_cfg)
+                policy_step_dt = float(policy_env.step_dt)
+                capture_step_count = max(1, int(round(args.capture_dt / policy_step_dt)))
+                capture_dt_effective = capture_step_count * policy_step_dt
+                create_prim("/World/Sensors", "Xform")
+                cameras, camera_frequency_hz = create_cameras(
+                    capture_dt_effective=capture_dt_effective,
+                    camera_mounts=camera_mounts,
+                )
+                policy = load_torchscript_policy(args.policy_checkpoint, args.policy_device)
+                obs, _ = policy_env.reset()
+                gt_world_points = build_scene_mesh_ground_truth_world("/World/ground")
+                policy_render = getattr(policy_env.sim, "render", None)
+                if not callable(policy_render):
+                    policy_render = lambda: simulation_app.update()
+
+                for step_index in range(args.timesteps):
+                    if hasattr(simulation_app, "is_running") and not simulation_app.is_running():
+                        ui_interrupted = True
+                        break
+                    write_status(
+                        "running",
+                        stage="collecting",
+                        trajectory_index=int(trajectory_index),
+                        timestep_index=int(step_index),
+                    )
+                    command_tensor = torch.as_tensor(
+                        policy_command_sequence[step_index],
+                        dtype=obs["policy"].dtype,
+                        device=obs["policy"].device,
+                    )
+                    for _ in range(capture_step_count):
+                        obs["policy"][:, 9:13] = command_tensor.unsqueeze(0)
+                        with torch.inference_mode():
+                            action = policy(obs["policy"])
+                        step_result = policy_env.step(action)
+                        if len(step_result) == 5:
+                            obs, _, terminated, truncated, _ = step_result
+                            terminated_now = bool(torch.any(terminated).item()) or bool(torch.any(truncated).item())
+                        else:
+                            obs, _, terminated, _ = step_result
+                            terminated_now = bool(torch.any(terminated).item()) if torch.is_tensor(terminated) else bool(terminated)
+                        if terminated_now:
+                            rollout_interrupted = True
+                            break
+
+                    robot_pose = policy_env_robot_pose(policy_env)
+                    collected_poses.append(robot_pose.astype(np.float32, copy=True))
+                    apply_robot_and_camera_pose(robot_pose, None, cameras, camera_mounts)
+                    render_frames(
+                        args.sensor_warmup_steps if step_index == 0 else 1,
+                        render_fn=policy_render,
+                    )
+                    measurement_local, ground_truth_step_local, visible_fraction, timestep_camera_locals, timestep_debug = capture_timestep_observation(
+                        step_index=step_index,
+                        robot_pose=robot_pose,
+                        cameras=cameras,
+                        gt_world_points=gt_world_points,
+                        max_points_per_camera=max_points_per_camera,
+                        render_retry_fn=lambda count: render_frames(count, render_fn=policy_render),
+                    )
+                    measurements_local.append(measurement_local)
+                    ground_truth_local.append(ground_truth_step_local)
+                    visible_ground_truth_fractions.append(visible_fraction)
+                    if raw_camera_clouds_local is not None:
+                        empty_local = np.empty((0, 3), dtype=np.float32)
+                        for camera_name in raw_camera_clouds_local:
+                            raw_camera_clouds_local[camera_name].append(timestep_camera_locals.get(camera_name, empty_local))
+                    if timestep_debug is not None:
+                        timestep_debug["policy_command"] = policy_command_sequence[step_index].astype(np.float32).tolist()
+                        trajectory_debug_steps.append(timestep_debug)
+                    if rollout_interrupted:
+                        break
+
+            if ui_interrupted:
+                print(
+                    f"[collector] ui requested shutdown after {len(measurements_local)} timesteps of trajectory {trajectory_index:03d}",
+                    flush=True,
+                )
+                write_status(
+                    "interrupted",
+                    stage="ui_shutdown",
+                    trajectory_index=int(trajectory_index),
+                    completed_timesteps=int(len(measurements_local)),
+                )
+                if measurements_local or ground_truth_local:
+                    partial_meta = save_trajectory_artifacts(
                         trajectory_index=trajectory_index,
+                        trajectory_poses=np.asarray(collected_poses, dtype=np.float32),
                         scene=scene,
-                        debug_steps=trajectory_debug_steps,
+                        scene_usd_path=scene_usd_path,
+                        capture_step_count=capture_step_count,
+                        capture_dt_effective=capture_dt_effective,
+                        camera_frequency_hz=camera_frequency_hz,
+                        measurements_local=measurements_local,
+                        ground_truth_local=ground_truth_local,
+                        visible_ground_truth_fractions=visible_ground_truth_fractions,
+                        raw_camera_clouds_local=raw_camera_clouds_local,
                         partial=True,
                     )
-                    save_manifest(args.output_dir, args, robot_usd_path, trajectories_meta, camera_mounts)
-                    return
+                    trajectories_meta.append(partial_meta)
+                save_debug_artifacts(
+                    trajectory_index=trajectory_index,
+                    scene=scene,
+                    capture_step_count=capture_step_count,
+                    capture_dt_effective=capture_dt_effective,
+                    camera_frequency_hz=camera_frequency_hz,
+                    debug_steps=trajectory_debug_steps,
+                    partial=True,
+                )
+                save_manifest(args.output_dir, args, robot_usd_path, trajectories_meta, camera_mounts)
+                return
 
-                write_status(
-                    "running",
-                    stage="collecting",
-                    trajectory_index=int(trajectory_index),
-                    timestep_index=int(step_index),
+            if rollout_interrupted:
+                print(
+                    f"[collector] rollout terminated early for trajectory {trajectory_index:03d}; saving partial trajectory",
+                    flush=True,
                 )
-                robot_pose = trajectory_poses[step_index]
-                # Replace this teleport with the original locomotion policy rollout if you
-                # have the checkpoint. The environment and camera rig stay unchanged.
-                apply_robot_and_camera_pose(robot_pose, robot, cameras)
-                step_render_frames(capture_substeps + (args.sensor_warmup_steps if step_index == 0 else 0))
-
-                measurement_world_chunks: List[np.ndarray] = []
-                world_to_robot = invert_transform(robot_pose)
-                timestep_camera_locals: Dict[str, np.ndarray] = {}
-                timestep_debug: Optional[Dict[str, object]] = None
-                if args.debug_camera:
-                    timestep_debug = {
-                        "timestep_index": int(step_index),
-                        "robot_position_world": robot_pose[:3, 3].astype(np.float32).tolist(),
-                        "robot_rotation_world": robot_pose[:3, :3].astype(np.float32).tolist(),
-                        "cameras": [],
-                    }
-                for camera_name, camera in cameras.items():
-                    camera_debug: Optional[Dict[str, object]] = None
-                    if timestep_debug is not None:
-                        camera_pose_world = camera_transform_world(camera)
-                        camera_debug = {
-                            "name": camera_name,
-                            "prim_path": str(camera.prim_path),
-                            "position_world": camera_pose_world[:3, 3].astype(np.float32).tolist(),
-                            "forward_world": camera_pose_world[:3, 0].astype(np.float32).tolist(),
-                        }
-                        timestep_debug["cameras"].append(camera_debug)
-
-                    points_world = capture_camera_points_world(camera, debug=camera_debug)
-                    if camera_debug is not None:
-                        camera_debug["points_before_finite_filter"] = int(points_world.shape[0])
-                    if points_world.size == 0:
-                        print(f"camera frame is empty after retries: {camera.prim_path}", flush=True)
-                        if camera_debug is not None:
-                            attempts = camera_debug.get("attempts", [])
-                            last_attempt = attempts[-1] if attempts else {}
-                            print(
-                                f"[debug-camera] {camera_name} empty "
-                                f"source={last_attempt.get('selected_source', 'unknown')} "
-                                f"depth_valid={last_attempt.get('depth_valid_pixel_count', 0)} "
-                                f"returned={last_attempt.get('returned_point_count', 0)}",
-                                flush=True,
-                            )
-                        continue
-                    finite_mask = np.isfinite(points_world).all(axis=1)
-                    points_world = points_world[finite_mask]
-                    if camera_debug is not None:
-                        camera_debug["points_after_finite_filter"] = int(points_world.shape[0])
-                    if points_world.size == 0:
-                        continue
-                    camera_position, _ = camera.get_world_pose(camera_axes="world")
-                    distances = np.linalg.norm(points_world - np.asarray(camera_position, dtype=np.float32), axis=1)
-                    range_mask = distances >= args.camera_min_range
-                    range_mask &= distances <= args.camera_max_range
-                    if camera_debug is not None and distances.size > 0:
-                        camera_debug["distance_stats_m"] = {
-                            "min": float(np.min(distances)),
-                            "max": float(np.max(distances)),
-                        }
-                    points_world = points_world[range_mask]
-                    if camera_debug is not None:
-                        camera_debug["points_after_range_filter"] = int(points_world.shape[0])
-                    if points_world.size == 0:
-                        continue
-                    points_world = points_world.astype(np.float32, copy=False)
-                    measurement_world_chunks.append(points_world)
-                    if raw_camera_clouds_local is not None:
-                        timestep_camera_locals[camera_name] = crop_local_points(
-                            transform_points(points_world, world_to_robot),
-                            GRID_BOUNDS_MIN,
-                            GRID_BOUNDS_MAX,
-                            max_points_per_camera,
-                            rng,
-                        )
-
-                measurement_world = (
-                    np.concatenate(measurement_world_chunks, axis=0)
-                    if measurement_world_chunks
-                    else np.empty((0, 3), dtype=np.float32)
+                partial_meta = save_trajectory_artifacts(
+                    trajectory_index=trajectory_index,
+                    trajectory_poses=np.asarray(collected_poses, dtype=np.float32),
+                    scene=scene,
+                    scene_usd_path=scene_usd_path,
+                    capture_step_count=capture_step_count,
+                    capture_dt_effective=capture_dt_effective,
+                    camera_frequency_hz=camera_frequency_hz,
+                    measurements_local=measurements_local,
+                    ground_truth_local=ground_truth_local,
+                    visible_ground_truth_fractions=visible_ground_truth_fractions,
+                    raw_camera_clouds_local=raw_camera_clouds_local,
+                    partial=True,
                 )
-                measurement_local = crop_local_points(
-                    transform_points(measurement_world, world_to_robot),
-                    GRID_BOUNDS_MIN,
-                    GRID_BOUNDS_MAX,
-                    args.max_measurement_points,
-                    rng,
+                save_debug_artifacts(
+                    trajectory_index=trajectory_index,
+                    scene=scene,
+                    capture_step_count=capture_step_count,
+                    capture_dt_effective=capture_dt_effective,
+                    camera_frequency_hz=camera_frequency_hz,
+                    debug_steps=trajectory_debug_steps,
+                    partial=True,
                 )
-                ground_truth_step_local = crop_local_points(
-                    transform_points(gt_world_points, world_to_robot),
-                    GRID_BOUNDS_MIN,
-                    GRID_BOUNDS_MAX,
-                    args.max_ground_truth_points,
-                    rng,
-                )
-                measurements_local.append(measurement_local)
-                ground_truth_local.append(ground_truth_step_local)
-                visible_ground_truth_fraction = estimate_visible_ground_truth_fraction(
-                    ground_truth_step_local,
-                    measurement_local,
-                    voxel_size=args.ground_truth_spacing,
-                    origin=GRID_BOUNDS_MIN,
-                )
-                visible_ground_truth_fractions.append(visible_ground_truth_fraction)
-                if raw_camera_clouds_local is not None:
-                    empty_local = np.empty((0, 3), dtype=np.float32)
-                    for camera_name in raw_camera_clouds_local:
-                        raw_camera_clouds_local[camera_name].append(
-                            timestep_camera_locals.get(camera_name, empty_local)
-                        )
-                if timestep_debug is not None:
-                    timestep_debug["measurement_world_point_count"] = int(measurement_world.shape[0])
-                    timestep_debug["measurement_local_point_count"] = int(measurement_local.shape[0])
-                    timestep_debug["ground_truth_local_point_count"] = int(ground_truth_step_local.shape[0])
-                    timestep_debug["visible_ground_truth_fraction"] = float(visible_ground_truth_fraction)
-                    trajectory_debug_steps.append(timestep_debug)
+                trajectories_meta.append(partial_meta)
+                continue
 
             write_status("running", stage="saving", trajectory_index=int(trajectory_index))
             trajectory_meta = save_trajectory_artifacts(
                 trajectory_index=trajectory_index,
-                trajectory_poses=trajectory_poses,
+                trajectory_poses=np.asarray(collected_poses, dtype=np.float32),
                 scene=scene,
+                scene_usd_path=scene_usd_path,
+                capture_step_count=capture_step_count,
+                capture_dt_effective=capture_dt_effective,
+                camera_frequency_hz=camera_frequency_hz,
                 measurements_local=measurements_local,
                 ground_truth_local=ground_truth_local,
                 visible_ground_truth_fractions=visible_ground_truth_fractions,
@@ -1473,6 +2035,9 @@ def run_collection(args: argparse.Namespace) -> None:
             save_debug_artifacts(
                 trajectory_index=trajectory_index,
                 scene=scene,
+                capture_step_count=capture_step_count,
+                capture_dt_effective=capture_dt_effective,
+                camera_frequency_hz=camera_frequency_hz,
                 debug_steps=trajectory_debug_steps,
                 partial=False,
             )
