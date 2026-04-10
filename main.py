@@ -55,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("runs/nsr_terrain"))
     parser.add_argument("--disable-augmentation", action="store_true")
     parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument("--save-every", type=int, default=50)
     parser.add_argument("--val-root", type=Path, default=None, help="Optional separate directory for validation .npz trajectories.")
     parser.add_argument(
         "--val-fraction",
@@ -284,6 +285,120 @@ def make_sparse_tensor(
     return ME.SparseTensor(coordinates=coordinates, features=features)
 
 
+def prepare_rollout_step(
+    *,
+    poses_batch: List[np.ndarray],
+    measurements_batch: List[List[np.ndarray]],
+    ground_truth_batch: List[List[np.ndarray]],
+    step: int,
+    previous_predictions: List[np.ndarray],
+    mirror_matrices: List[np.ndarray],
+    grid_config: GridConfig,
+    augmentation_config: AugmentationConfig,
+    device: torch.device,
+    rng: np.random.Generator,
+    apply_augmentation: bool,
+) -> Optional[Tuple[ME.SparseTensor, torch.Tensor, torch.Tensor]]:
+    input_coordinate_batches: List[np.ndarray] = []
+    input_feature_batches: List[np.ndarray] = []
+    target_coordinate_batches: List[np.ndarray] = []
+    target_feature_batches: List[np.ndarray] = []
+
+    for batch_index in range(len(poses_batch)):
+        current_pose = poses_batch[batch_index][step]
+        measurement_local = measurements_batch[batch_index][step].astype(np.float32, copy=False)
+        target_local = ground_truth_batch[batch_index][step].astype(np.float32, copy=False)
+
+        mirror_matrix = mirror_matrices[batch_index]
+        measurement_local = apply_local_mirror(measurement_local, mirror_matrix)
+        target_local = apply_local_mirror(target_local, mirror_matrix)
+
+        if apply_augmentation:
+            measurement_local = apply_measurement_augmentations(
+                measurement_local,
+                rng,
+                augmentation_config,
+            )
+
+        previous_prediction_local = previous_predictions[batch_index]
+        if step > 0 and previous_prediction_local.size > 0:
+            prev_pose = poses_batch[batch_index][step - 1]
+            transform_prev_to_current = relative_transform(prev_pose, current_pose)
+            transform_prev_to_current = mirror_relative_transform(
+                transform_prev_to_current,
+                mirror_matrix,
+            )
+            if apply_augmentation:
+                transform_prev_to_current = (
+                    sample_pose_translation_noise(
+                        rng,
+                        augmentation_config.pose_translation_noise,
+                    )
+                    @ transform_prev_to_current
+                )
+            previous_prediction_local = transform_points(
+                previous_prediction_local,
+                transform_prev_to_current,
+            )
+
+        model_input = build_network_input(
+            current_measurement=measurement_local,
+            previous_prediction=previous_prediction_local,
+            grid=grid_config,
+        )
+        target = voxelize_points(
+            target_local,
+            grid_config,
+            time_index=grid_config.current_time_index,
+        )
+
+        input_coordinate_batches.append(model_input.coordinates)
+        input_feature_batches.append(model_input.features)
+        target_coordinate_batches.append(target.coordinates)
+        target_feature_batches.append(target.features)
+
+    if not any(coordinates.size > 0 for coordinates in input_coordinate_batches):
+        return None
+
+    sparse_input = make_sparse_tensor(
+        input_coordinate_batches,
+        input_feature_batches,
+        device,
+    )
+    target_coordinates = make_batched_coordinate_tensor(target_coordinate_batches, device)
+    target_features = make_batched_feature_tensor(target_feature_batches, device)
+    return sparse_input, target_coordinates, target_features
+
+
+def forward_rollout_step(
+    *,
+    model: TerrainReconstructionModel,
+    sparse_input: ME.SparseTensor,
+    target_coordinates: torch.Tensor,
+    target_features: torch.Tensor,
+    grid_config: GridConfig,
+    batch_size: int,
+    occupancy_weight: float,
+    regression_weight: float,
+) -> Tuple[Dict[str, torch.Tensor], List[np.ndarray]]:
+    output = model(sparse_input)
+    losses = reconstruction_loss(
+        output,
+        target_coordinates,
+        target_features,
+        occupancy_weight=occupancy_weight,
+        regression_weight=regression_weight,
+    )
+    predictions = decode_predictions_to_point_clouds(
+        output.offsets.C,
+        output.offsets.F,
+        grid=grid_config,
+        batch_size=batch_size,
+        time_index=grid_config.current_time_index,
+    )
+    return losses, predictions
+
+
 def rollout_batch(
     model: TerrainReconstructionModel,
     batch: Dict[str, object],
@@ -313,80 +428,29 @@ def rollout_batch(
     valid_steps = 0
 
     for step in range(sequence_length):
-        input_coordinate_batches: List[np.ndarray] = []
-        input_feature_batches: List[np.ndarray] = []
-        target_coordinate_batches: List[np.ndarray] = []
-        target_feature_batches: List[np.ndarray] = []
-
-        for batch_index in range(batch_size):
-            current_pose = poses_batch[batch_index][step]
-            measurement_local = measurements_batch[batch_index][step].astype(np.float32, copy=False)
-            target_local = ground_truth_batch[batch_index][step].astype(np.float32, copy=False)
-
-            mirror_matrix = mirror_matrices[batch_index]
-            measurement_local = apply_local_mirror(measurement_local, mirror_matrix)
-            target_local = apply_local_mirror(target_local, mirror_matrix)
-
-            if apply_augmentation:
-                measurement_local = apply_measurement_augmentations(
-                    measurement_local,
-                    rng,
-                    augmentation_config,
-                )
-
-            previous_prediction_local = previous_predictions[batch_index]
-            if step > 0 and previous_prediction_local.size > 0:
-                prev_pose = poses_batch[batch_index][step - 1]
-                transform_prev_to_current = relative_transform(prev_pose, current_pose)
-                transform_prev_to_current = mirror_relative_transform(
-                    transform_prev_to_current,
-                    mirror_matrix,
-                )
-                if apply_augmentation:
-                    transform_prev_to_current = (
-                        sample_pose_translation_noise(
-                            rng,
-                            augmentation_config.pose_translation_noise,
-                        )
-                        @ transform_prev_to_current
-                    )
-                previous_prediction_local = transform_points(
-                    previous_prediction_local,
-                    transform_prev_to_current,
-                )
-
-            model_input = build_network_input(
-                current_measurement=measurement_local,
-                previous_prediction=previous_prediction_local,
-                grid=grid_config,
-            )
-            target = voxelize_points(
-                target_local,
-                grid_config,
-                time_index=grid_config.current_time_index,
-            )
-
-            input_coordinate_batches.append(model_input.coordinates)
-            input_feature_batches.append(model_input.features)
-            target_coordinate_batches.append(target.coordinates)
-            target_feature_batches.append(target.features)
-
-        if not any(coordinates.size > 0 for coordinates in input_coordinate_batches):
-            continue
-
-        sparse_input = make_sparse_tensor(
-            input_coordinate_batches,
-            input_feature_batches,
-            device,
+        step_tensors = prepare_rollout_step(
+            poses_batch=poses_batch,
+            measurements_batch=measurements_batch,
+            ground_truth_batch=ground_truth_batch,
+            step=step,
+            previous_predictions=previous_predictions,
+            mirror_matrices=mirror_matrices,
+            grid_config=grid_config,
+            augmentation_config=augmentation_config,
+            device=device,
+            rng=rng,
+            apply_augmentation=apply_augmentation,
         )
-        output = model(sparse_input)
-
-        target_coordinates = make_batched_coordinate_tensor(target_coordinate_batches, device)
-        target_features = make_batched_feature_tensor(target_feature_batches, device)
-        losses = reconstruction_loss(
-            output,
-            target_coordinates,
-            target_features,
+        if step_tensors is None:
+            continue
+        sparse_input, target_coordinates, target_features = step_tensors
+        losses, previous_predictions = forward_rollout_step(
+            model=model,
+            sparse_input=sparse_input,
+            target_coordinates=target_coordinates,
+            target_features=target_features,
+            grid_config=grid_config,
+            batch_size=batch_size,
             occupancy_weight=occupancy_weight,
             regression_weight=regression_weight,
         )
@@ -403,14 +467,6 @@ def rollout_batch(
             else accumulated_regression + losses["regression"]
         )
         valid_steps += 1
-
-        previous_predictions = decode_predictions_to_point_clouds(
-            output.offsets.C,
-            output.offsets.F,
-            grid=grid_config,
-            batch_size=batch_size,
-            time_index=grid_config.current_time_index,
-        )
 
     if valid_steps == 0:
         zero = torch.tensor(0.0, device=device)
@@ -447,6 +503,7 @@ def main() -> None:
         min_learning_rate=args.min_learning_rate,
         weight_decay=args.weight_decay,
         log_every=args.log_every,
+        save_every=args.save_every,
         device=args.device,
         output_dir=args.output_dir,
     )
@@ -518,7 +575,7 @@ def main() -> None:
         weight_decay=train_config.weight_decay,
     )
 
-    total_steps = max(len(train_loader) * train_config.epochs, 1)
+    total_steps = max(len(train_loader) * train_config.sequence_length * train_config.epochs, 1)
     gamma = math.exp(
         math.log(train_config.min_learning_rate / train_config.learning_rate) / total_steps
     )
@@ -548,56 +605,92 @@ def main() -> None:
         train_step_count = 0
 
         for batch in train_loader:
+            poses_batch: List[np.ndarray] = batch["poses"]  # type: ignore[assignment]
+            measurements_batch: List[List[np.ndarray]] = batch["measurements"]  # type: ignore[assignment]
+            ground_truth_batch: List[List[np.ndarray]] = batch["ground_truth"]  # type: ignore[assignment]
+            batch_size = len(poses_batch)
+            sequence_length = len(measurements_batch[0])
+            mirror_matrices = [
+                sample_sequence_mirror(rng, augmentation_config)
+                if not args.disable_augmentation
+                else np.eye(4, dtype=np.float32)
+                for _ in range(batch_size)
+            ]
+            previous_predictions = [np.empty((0, 3), dtype=np.float32) for _ in range(batch_size)]
             batch_ready_time = time.perf_counter()
             data_wait_time = batch_ready_time - last_step_end
-            optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=use_amp):
-                losses = rollout_batch(
-                    model=model,
-                    batch=batch,
+            batch_step_count = 0
+
+            for step in range(sequence_length):
+                step_tensors = prepare_rollout_step(
+                    poses_batch=poses_batch,
+                    measurements_batch=measurements_batch,
+                    ground_truth_batch=ground_truth_batch,
+                    step=step,
+                    previous_predictions=previous_predictions,
+                    mirror_matrices=mirror_matrices,
                     grid_config=grid_config,
                     augmentation_config=augmentation_config,
                     device=device,
                     rng=rng,
                     apply_augmentation=not args.disable_augmentation,
-                    occupancy_weight=train_config.occupancy_loss_weight,
-                    regression_weight=train_config.regression_loss_weight,
                 )
-            if use_amp:
-                scaler.scale(losses["total"]).backward()
-                if args.gradient_clip_norm > 0.0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.gradient_clip_norm)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                losses["total"].backward()
-                if args.gradient_clip_norm > 0.0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.gradient_clip_norm)
-                optimizer.step()
-            scheduler.step()
-            if use_cuda and args.print_timing:
-                torch.cuda.synchronize(device)
-            step_end_time = time.perf_counter()
-            step_time = step_end_time - batch_ready_time
-            for key in train_loss_sums:
-                train_loss_sums[key] += float(losses[key].item())
-            train_step_count += 1
+                if step_tensors is None:
+                    continue
+                sparse_input, target_coordinates, target_features = step_tensors
 
-            if global_step % train_config.log_every == 0:
-                lr = optimizer.param_groups[0]["lr"]
-                message = (
-                    f"epoch={epoch} step={global_step} "
-                    f"loss={losses['total'].item():.4f} "
-                    f"occ={losses['occupancy'].item():.4f} "
-                    f"reg={losses['regression'].item():.4f} "
-                    f"lr={lr:.6f}"
-                )
-                if args.print_timing:
-                    message += f" data={data_wait_time:.4f}s step={step_time:.4f}s"
-                print(message)
-            global_step += 1
-            last_step_end = step_end_time
+                step_start_time = time.perf_counter()
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=use_amp):
+                    losses, previous_predictions = forward_rollout_step(
+                        model=model,
+                        sparse_input=sparse_input,
+                        target_coordinates=target_coordinates,
+                        target_features=target_features,
+                        grid_config=grid_config,
+                        batch_size=batch_size,
+                        occupancy_weight=train_config.occupancy_loss_weight,
+                        regression_weight=train_config.regression_loss_weight,
+                    )
+                if use_amp:
+                    scaler.scale(losses["total"]).backward()
+                    if args.gradient_clip_norm > 0.0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.gradient_clip_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    losses["total"].backward()
+                    if args.gradient_clip_norm > 0.0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.gradient_clip_norm)
+                    optimizer.step()
+                scheduler.step()
+                if use_cuda and args.print_timing:
+                    torch.cuda.synchronize(device)
+                step_end_time = time.perf_counter()
+                step_time = step_end_time - step_start_time
+                step_data_wait_time = data_wait_time if batch_step_count == 0 else 0.0
+                for key in train_loss_sums:
+                    train_loss_sums[key] += float(losses[key].item())
+                train_step_count += 1
+                batch_step_count += 1
+
+                if global_step % train_config.log_every == 0:
+                    lr = optimizer.param_groups[0]["lr"]
+                    message = (
+                        f"epoch={epoch} step={global_step} "
+                        f"loss={losses['total'].item():.4f} "
+                        f"occ={losses['occupancy'].item():.4f} "
+                        f"reg={losses['regression'].item():.4f} "
+                        f"lr={lr:.6f}"
+                    )
+                    if args.print_timing:
+                        message += f" data={step_data_wait_time:.4f}s step={step_time:.4f}s"
+                    print(message)
+                global_step += 1
+                last_step_end = step_end_time
+            if batch_step_count == 0:
+                last_step_end = time.perf_counter()
 
         train_metrics = mean_loss_dict(train_loss_sums, train_step_count)
         validation_metrics = evaluate_model(
@@ -629,7 +722,8 @@ def main() -> None:
             train_metrics=train_metrics,
             validation_metrics=validation_metrics,
         )
-        save_checkpoint(checkpoint, train_config.output_dir / f"epoch_{epoch:04d}.pt")
+        if epoch % train_config.save_every == 0:
+            save_checkpoint(checkpoint, train_config.output_dir / f"epoch_{epoch:04d}.pt")
         save_checkpoint(checkpoint, train_config.output_dir / "last.pt")
         if is_best:
             save_checkpoint(checkpoint, train_config.output_dir / "best.pt")

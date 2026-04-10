@@ -60,5 +60,6 @@ class TrainConfig:
     occupancy_loss_weight: float = 1.0
     regression_loss_weight: float = 1.0
     log_every: int = 10
+    save_every: int = 50
     device: str = "cuda"
     output_dir: Path = field(default_factory=lambda: Path("runs/nsr_terrain"))

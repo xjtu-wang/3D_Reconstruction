@@ -56,13 +56,19 @@ python train.py --data-root path/to/trajectories
 Useful flags:
 
 ```bash
-python train.py \
+CUDA_VISIBLE_DEVICES=1 nohup python -u train.py \
   --data-root path/to/trajectories \
+  --output-dir runs/test2 \
   --epochs 50 \
   --batch-size 2 \
   --sequence-length 12 \
   --learning-rate 1e-2 \
-  --min-learning-rate 1e-4
+  --min-learning-rate 1e-4 \
+  --num-workers 8 \
+  --amp \
+  --val-fraction 0 \
+  --print-timing \
+  --cache-dataset 2>&1 | tee runs2.log &
 ```
 
 ## Mock Data
@@ -83,13 +89,17 @@ For the dataset collection stage there is now a standalone script:
 ./python.sh collect_isaacsim_dataset.py \
   --output-dir data/isaacsim_paper_style \
   --num-trajectories 64 \
-  --timesteps 48
+  --timesteps 48 \
+  --motion-source policy_rollout \
+  --policy-checkpoint path/to/exported/policy.pt
 ```
 
 What it does:
 
-- Builds paper-style structured scenes with stairs, boxes, walls, poles, and narrow corridors.
-- Uses an ANYmal C asset with four depth cameras placed at the front, back, left, and right, tilted downward by `30°`.
+- Builds a [`DataCollect.py`](DataCollect.py)-aligned scene: four walls, two mirrored staircases, `30` boxes, and `10` cylindrical poles in a `20 m` corridor.
+- Samples one global scene ratio per trajectory and maps it jointly into the paper ranges for corridor width, stair tread/rise, and box size.
+- Uses the fixed ANYmal C `front / back / left / right` depth-camera rig with `30°` downward tilt and explicit `RealSense D435-like` pinhole intrinsics.
+- Uses dense sampling from the live simulator scene mesh as ground truth.
 - Writes packed `.npz` trajectories in the exact format expected by `train.py`.
 - Can optionally save each camera's robot-local point cloud alongside the fused measurement cloud for later multi-view experiments.
 
@@ -98,11 +108,9 @@ Useful flags:
 ```bash
 ./python.sh collect_isaacsim_dataset.py \
   --output-dir data/isaacsim_paper_style \
-  --asset-root omniverse://localhost/NVIDIA/Assets/Isaac/4.5 \
-  --camera-width 1280 \
-  --camera-height 800 \
-  --trajectory-mode velocity_command \
-  --camera-layout leg_proxy \
+  --motion-source policy_rollout \
+  --policy-checkpoint path/to/exported/policy.pt \
+  --policy-device cuda:0 \
   --save-raw-camera-clouds \
   --show-ui \
   --show-robot
@@ -110,11 +118,12 @@ Useful flags:
 
 Notes:
 
-- If the ANYmal C asset is not under the default Isaac Sim asset root, pass `--robot-usd` or `--asset-root`.
-- The original paper used a rough-terrain locomotion policy to move the robot. This repo currently uses a kinematically sampled reachable base trajectory with the same scene and sensor configuration, because the original policy checkpoint is not part of this repository.
-- The paper-faithful camera rig is still `front/back/left/right` with `30°` downward tilt. `--camera-layout leg_proxy` is exploratory only and should not be treated as the main reproduction setting.
-- `--camera-layout leg_proxy` is a collection baseline that approximates one camera near each leg corner in the base frame. It is useful for data-pipeline validation, but it is not a true articulated leg-link attachment.
-- See [`docs/isaaclab_reproduction_baseline.md`](docs/isaaclab_reproduction_baseline.md) for a practical migration path from this collector to an Isaac Lab policy-driven rollout.
+- `--motion-source policy_rollout` is now the paper-faithful default path. It expects an exported Isaac Lab TorchScript/JIT checkpoint.
+- `--motion-source velocity_fallback` is still available when you need a format-compatible dataset without a policy checkpoint.
+- In `policy_rollout` mode the collector loads the DataCollect-aligned USD scene into Isaac Lab, drives ANYmal C with the policy, and samples GT from the loaded scene mesh rather than from camera observations.
+- If you use `velocity_fallback`, `--robot-usd` or `--asset-root` may still be needed to resolve the ANYmal C USD asset.
+- `--path-length`, `--wall-height`, `--wall-thickness`, and camera tilt are now locked to the DataCollect / paper-aligned values and will error if changed.
+- See [`docs/isaaclab_reproduction_baseline.md`](docs/isaaclab_reproduction_baseline.md) for the strict paper-alignment notes and fallback tradeoffs.
 
 ## Open3D Visualization
 
