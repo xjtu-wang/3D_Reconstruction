@@ -13,10 +13,24 @@ import numpy as np
 
 GRID_BOUNDS_MIN = np.array([-1.6, -1.6, -1.6], dtype=np.float32)
 GRID_BOUNDS_MAX = np.array([1.6, 1.6, 1.6], dtype=np.float32)
-DEFAULT_WALL_HEIGHT = 1.0
-DEFAULT_WALL_THICKNESS = 0.12
-DEFAULT_POLE_HEIGHT = 1.0
+DATACOLLECT_SCENE_LAYOUT = "datacollect_aligned"
+DATACOLLECT_SCENE_LENGTH = 20.0
+DATACOLLECT_WALL_HEIGHT = 3.0
+DATACOLLECT_WALL_THICKNESS = 0.1
+DATACOLLECT_STAIR_START_OFFSET_X = 2.7
+DATACOLLECT_STAIR_STEP_COUNT = 10
+DATACOLLECT_BOX_COUNT = 30
+DATACOLLECT_POLE_COUNT = 10
+DATACOLLECT_POLE_RADIUS = 0.25
+DATACOLLECT_POLE_HEIGHT = 3.0
+DEFAULT_WALL_HEIGHT = DATACOLLECT_WALL_HEIGHT
+DEFAULT_WALL_THICKNESS = DATACOLLECT_WALL_THICKNESS
+DEFAULT_POLE_HEIGHT = DATACOLLECT_POLE_HEIGHT
 DEFAULT_BODY_HEIGHT = 0.55
+DEFAULT_CAMERA_PROFILE = "realsense_d435_like"
+DEFAULT_CAMERA_HFOV_DEG = 86.0
+DEFAULT_CAMERA_VFOV_DEG = 57.0
+DEFAULT_CAMERA_FOCAL_LENGTH_MM = 1.93
 
 
 @dataclass(frozen=True)
@@ -36,8 +50,33 @@ class BoxPrimitive:
 
 
 @dataclass(frozen=True)
+class CylinderPrimitive:
+    name: str
+    center: np.ndarray
+    radius: float
+    height: float
+
+
+@dataclass(frozen=True)
+class CameraProfile:
+    name: str
+    width: int
+    height: int
+    hfov_deg: float
+    vfov_deg: float
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    focal_length_mm: float
+    horizontal_aperture_mm: float
+    vertical_aperture_mm: float
+
+
+@dataclass(frozen=True)
 class SceneDescription:
-    scene_yaw_radians: float
+    layout: str
+    scene_scale_ratio: float
     path_length: float
     corridor_width: float
     stair_start_x: float
@@ -45,26 +84,83 @@ class SceneDescription:
     stair_rise: float
     stair_steps: int
     stair_width: float
-    landing_length: float
+    stair_start_x_opposite: float
+    box_size: np.ndarray
+    pole_radius: float
+    pole_height: float
     ground_size: np.ndarray
-    boxes_local: Tuple[BoxPrimitive, ...]
-
-    @property
-    def stair_end_x(self) -> float:
-        return self.stair_start_x + self.stair_steps * self.stair_tread
+    cuboids_local: Tuple[BoxPrimitive, ...]
+    cylinders_local: Tuple[CylinderPrimitive, ...]
+    support_boxes_local: Tuple[BoxPrimitive, ...]
 
     def support_height(self, x_local: float, y_local: float) -> float:
-        if abs(y_local) > 0.5 * self.stair_width:
-            return 0.0
-        for step_index in range(self.stair_steps):
-            step_start = self.stair_start_x + step_index * self.stair_tread
-            step_end = step_start + self.stair_tread
-            if step_start <= x_local < step_end:
-                return float((step_index + 1) * self.stair_rise)
-        landing_end = self.stair_end_x + self.landing_length
-        if self.stair_end_x <= x_local < landing_end:
-            return float(self.stair_steps * self.stair_rise)
-        return 0.0
+        surface_height = 0.0
+        point_xy = np.array([x_local, y_local], dtype=np.float32)
+        for box in self.support_boxes_local:
+            if box.top_only:
+                half_size_xy = 0.5 * box.size[:2]
+                if np.all(np.abs(point_xy - box.center[:2]) <= half_size_xy + 1e-6):
+                    surface_height = max(surface_height, float(box.center[2] + 0.5 * box.size[2]))
+                continue
+
+            local_xy = point_xy - box.center[:2]
+            if not math.isclose(box.yaw_radians, 0.0, rel_tol=0.0, abs_tol=1e-6):
+                cos_yaw = math.cos(-box.yaw_radians)
+                sin_yaw = math.sin(-box.yaw_radians)
+                local_xy = np.array(
+                    [
+                        cos_yaw * local_xy[0] - sin_yaw * local_xy[1],
+                        sin_yaw * local_xy[0] + cos_yaw * local_xy[1],
+                    ],
+                    dtype=np.float32,
+                )
+
+            half_size_xy = 0.5 * box.size[:2]
+            if np.all(np.abs(local_xy) <= half_size_xy + 1e-6):
+                surface_height = max(surface_height, float(box.center[2] + 0.5 * box.size[2]))
+        return surface_height
+
+
+def build_camera_profile(width: int, height: int) -> CameraProfile:
+    hfov_radians = math.radians(DEFAULT_CAMERA_HFOV_DEG)
+    vfov_radians = math.radians(DEFAULT_CAMERA_VFOV_DEG)
+    fx = float(width / (2.0 * math.tan(0.5 * hfov_radians)))
+    fy = float(height / (2.0 * math.tan(0.5 * vfov_radians)))
+    cx = 0.5 * float(width - 1)
+    cy = 0.5 * float(height - 1)
+    horizontal_aperture_mm = 2.0 * DEFAULT_CAMERA_FOCAL_LENGTH_MM * math.tan(0.5 * hfov_radians)
+    vertical_aperture_mm = 2.0 * DEFAULT_CAMERA_FOCAL_LENGTH_MM * math.tan(0.5 * vfov_radians)
+    return CameraProfile(
+        name=DEFAULT_CAMERA_PROFILE,
+        width=int(width),
+        height=int(height),
+        hfov_deg=float(DEFAULT_CAMERA_HFOV_DEG),
+        vfov_deg=float(DEFAULT_CAMERA_VFOV_DEG),
+        fx=fx,
+        fy=fy,
+        cx=cx,
+        cy=cy,
+        focal_length_mm=float(DEFAULT_CAMERA_FOCAL_LENGTH_MM),
+        horizontal_aperture_mm=float(horizontal_aperture_mm),
+        vertical_aperture_mm=float(vertical_aperture_mm),
+    )
+
+
+def camera_profile_metadata(camera_profile: CameraProfile) -> Dict[str, object]:
+    return {
+        "name": camera_profile.name,
+        "width": int(camera_profile.width),
+        "height": int(camera_profile.height),
+        "hfov_deg": float(camera_profile.hfov_deg),
+        "vfov_deg": float(camera_profile.vfov_deg),
+        "fx": float(camera_profile.fx),
+        "fy": float(camera_profile.fy),
+        "cx": float(camera_profile.cx),
+        "cy": float(camera_profile.cy),
+        "focal_length_mm": float(camera_profile.focal_length_mm),
+        "horizontal_aperture_mm": float(camera_profile.horizontal_aperture_mm),
+        "vertical_aperture_mm": float(camera_profile.vertical_aperture_mm),
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -137,7 +233,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--physics-dt", type=float, default=1.0 / 60.0)
     parser.add_argument("--capture-dt", type=float, default=0.10)
-    parser.add_argument("--path-length", type=float, default=8.0)
+    parser.add_argument("--path-length", type=float, default=DATACOLLECT_SCENE_LENGTH)
     parser.add_argument("--nominal-base-height", type=float, default=DEFAULT_BODY_HEIGHT)
     parser.add_argument("--ground-truth-spacing", type=float, default=0.05)
     parser.add_argument("--max-measurement-points", type=int, default=20000)
@@ -303,6 +399,21 @@ def parse_args() -> argparse.Namespace:
         raise SystemExit(
             "The paper-faithful collector fixes the camera tilt at 30 degrees. "
             "Remove --camera-down-tilt-deg or set it to 30."
+        )
+
+    if not math.isclose(float(args.path_length), DATACOLLECT_SCENE_LENGTH, rel_tol=0.0, abs_tol=1e-6):
+        raise SystemExit(
+            f"The DataCollect-aligned collector fixes --path-length at {DATACOLLECT_SCENE_LENGTH:.1f} m."
+        )
+
+    if not math.isclose(float(args.wall_height), DATACOLLECT_WALL_HEIGHT, rel_tol=0.0, abs_tol=1e-6):
+        raise SystemExit(
+            f"The DataCollect-aligned collector fixes --wall-height at {DATACOLLECT_WALL_HEIGHT:.1f} m."
+        )
+
+    if not math.isclose(float(args.wall_thickness), DATACOLLECT_WALL_THICKNESS, rel_tol=0.0, abs_tol=1e-6):
+        raise SystemExit(
+            f"The DataCollect-aligned collector fixes --wall-thickness at {DATACOLLECT_WALL_THICKNESS:.1f} m."
         )
 
     if "Anymal-C" not in args.policy_task and "Anymal_C" not in args.policy_task and "Anymal" not in args.policy_task:
@@ -553,137 +664,164 @@ def build_camera_mounts(args: argparse.Namespace) -> Tuple[CameraMount, ...]:
     )
 
 
+def lerp(min_value: float, max_value: float, ratio: float) -> float:
+    return float(min_value + (max_value - min_value) * ratio)
+
+
 def build_random_scene(rng: np.random.Generator, args: argparse.Namespace) -> SceneDescription:
-    corridor_width = float(rng.uniform(2.0, 6.0))
-    path_length = float(args.path_length * rng.uniform(0.8, 1.2))
-    stair_tread = float(rng.uniform(0.2, 0.5))
-    stair_rise = float(rng.uniform(0.08, 0.25))
-    stair_steps = int(rng.integers(4, 7))
-    stair_width = float(max(1.0, min(corridor_width - 0.4, corridor_width * rng.uniform(0.65, 0.95))))
-    landing_length = float(rng.uniform(0.8, 1.4))
-    ground_length = max(path_length + 4.0, stair_tread * stair_steps + landing_length + 5.0)
-    ground_width = corridor_width + 4.0
-    scene_yaw_radians = float(rng.uniform(-math.pi, math.pi))
-    stair_start_x = float(-0.2 * path_length)
-
-    boxes_local: List[BoxPrimitive] = []
-    boxes_local.append(
-        BoxPrimitive(
-            name="ground",
-            center=np.array([0.0, 0.0, -0.01], dtype=np.float32),
-            size=np.array([ground_length, ground_width, 0.02], dtype=np.float32),
-            yaw_radians=0.0,
-            top_only=True,
+    scene_scale_ratio = float(rng.uniform(0.0, 1.0))
+    corridor_width = lerp(2.0, 6.0, scene_scale_ratio)
+    stair_tread = lerp(0.2, 0.5, scene_scale_ratio)
+    stair_rise = lerp(0.08, 0.25, scene_scale_ratio)
+    stair_steps = DATACOLLECT_STAIR_STEP_COUNT
+    stair_width = float(corridor_width - 2.0 * args.wall_thickness - 0.5)
+    if stair_width <= 0.0:
+        raise RuntimeError(
+            "The DataCollect-aligned stair width became non-positive. "
+            f"corridor_width={corridor_width:.3f}, wall_thickness={args.wall_thickness:.3f}"
         )
-    )
 
-    half_wall_y = 0.5 * corridor_width + 0.5 * args.wall_thickness
-    for side, sign in (("left_wall", 1.0), ("right_wall", -1.0)):
-        boxes_local.append(
+    box_size = np.array(
+        [
+            lerp(0.2, 2.0, scene_scale_ratio),
+            lerp(0.2, 2.0, scene_scale_ratio),
+            lerp(0.08, 0.25, scene_scale_ratio),
+        ],
+        dtype=np.float32,
+    )
+    ground_size = np.array([float(args.path_length + 2.0), float(corridor_width + 2.0), 0.02], dtype=np.float32)
+
+    cuboids_local: List[BoxPrimitive] = []
+    cylinders_local: List[CylinderPrimitive] = []
+    support_boxes_local: List[BoxPrimitive] = []
+
+    ground = BoxPrimitive(
+        name="ground",
+        center=np.array([0.0, 0.0, -0.01], dtype=np.float32),
+        size=ground_size,
+        yaw_radians=0.0,
+        top_only=True,
+    )
+    cuboids_local.append(ground)
+    support_boxes_local.append(ground)
+
+    wall_positions = (
+        (-0.5 * args.path_length, 0.0),
+        (0.5 * args.path_length, 0.0),
+        (0.0, -0.5 * corridor_width),
+        (0.0, 0.5 * corridor_width),
+    )
+    for wall_index, (wall_x, wall_y) in enumerate(wall_positions):
+        if math.isclose(wall_x, 0.0, rel_tol=0.0, abs_tol=1e-6):
+            wall_size = np.array([args.path_length, args.wall_thickness, args.wall_height], dtype=np.float32)
+        else:
+            wall_size = np.array([args.wall_thickness, corridor_width, args.wall_height], dtype=np.float32)
+        cuboids_local.append(
             BoxPrimitive(
-                name=side,
-                center=np.array([0.0, sign * half_wall_y, 0.5 * args.wall_height], dtype=np.float32),
-                size=np.array([ground_length, args.wall_thickness, args.wall_height], dtype=np.float32),
+                name=f"wall_{wall_index:02d}",
+                center=np.array([wall_x, wall_y, 0.5 * args.wall_height], dtype=np.float32),
+                size=wall_size,
                 yaw_radians=0.0,
             )
         )
 
-    for step_index in range(stair_steps):
-        step_height = (step_index + 1) * stair_rise
-        step_center_x = stair_start_x + (step_index + 0.5) * stair_tread
-        boxes_local.append(
+    def append_stair(name: str, start_x: float, direction: float) -> None:
+        for step_index in range(stair_steps):
+            center_x = float(start_x + step_index * stair_tread * direction)
+            center_z = float(0.5 * stair_rise * (step_index + 1))
+            step_size = np.array([stair_tread, stair_width, stair_rise * (step_index + 1)], dtype=np.float32)
+            step_box = BoxPrimitive(
+                name=f"{name}_step_{step_index:02d}",
+                center=np.array([center_x, 0.0, center_z], dtype=np.float32),
+                size=step_size,
+                yaw_radians=0.0,
+            )
+            cuboids_local.append(step_box)
+            support_boxes_local.append(step_box)
+
+    append_stair("stair_pos", DATACOLLECT_STAIR_START_OFFSET_X, -1.0)
+    append_stair("stair_neg", -DATACOLLECT_STAIR_START_OFFSET_X, 1.0)
+
+    box_half = 0.5 * box_size
+    for index in range(DATACOLLECT_BOX_COUNT):
+        on_left = index < (DATACOLLECT_BOX_COUNT // 2)
+        if on_left:
+            x_min = -0.5 * args.path_length + float(box_half[0])
+            x_max = 0.0
+            name = f"box_left_{index:02d}"
+        else:
+            x_min = 0.0
+            x_max = 0.5 * args.path_length - float(box_half[0])
+            name = f"box_right_{index:02d}"
+        y_min = -0.5 * corridor_width + float(box_half[1])
+        y_max = 0.5 * corridor_width - float(box_half[1])
+        cuboids_local.append(
             BoxPrimitive(
-                name=f"stair_{step_index:02d}",
-                center=np.array([step_center_x, 0.0, 0.5 * step_height], dtype=np.float32),
-                size=np.array([stair_tread, stair_width, step_height], dtype=np.float32),
+                name=name,
+                center=np.array(
+                    [
+                        float(rng.uniform(x_min, x_max)),
+                        float(rng.uniform(y_min, y_max)),
+                        float(rng.uniform(0.0, float(box_half[2]))),
+                    ],
+                    dtype=np.float32,
+                ),
+                size=box_size.copy(),
                 yaw_radians=0.0,
             )
         )
 
-    landing_height = stair_steps * stair_rise
-    boxes_local.append(
-        BoxPrimitive(
-            name="stair_landing",
-            center=np.array(
-                [stair_start_x + stair_steps * stair_tread + 0.5 * landing_length, 0.0, 0.5 * landing_height],
-                dtype=np.float32,
-            ),
-            size=np.array([landing_length, stair_width, landing_height], dtype=np.float32),
-            yaw_radians=0.0,
-        )
+    pole_x_min = -0.5 * args.path_length + 0.5 * args.wall_thickness + DATACOLLECT_POLE_RADIUS
+    pole_x_max = 0.5 * args.path_length - 0.5 * args.wall_thickness - DATACOLLECT_POLE_RADIUS
+    pole_y_positions = (
+        -0.5 * corridor_width + 0.5 * args.wall_thickness + DATACOLLECT_POLE_RADIUS,
+        0.5 * corridor_width - 0.5 * args.wall_thickness - DATACOLLECT_POLE_RADIUS,
     )
-
-    def sample_side_center(half_length_x: float, half_length_y: float) -> Optional[np.ndarray]:
-        attempts = 0
-        while attempts < 32:
-            x = float(rng.uniform(-0.45 * ground_length, 0.45 * ground_length))
-            lateral_limit = 0.5 * corridor_width - half_length_y - 0.15
-            min_abs_y = max(0.55, half_length_y + 0.10)
-            if lateral_limit <= min_abs_y:
-                return None
-            y = float(rng.choice([-1.0, 1.0]) * rng.uniform(min_abs_y, lateral_limit))
-            near_stairs = stair_start_x - half_length_x <= x <= (
-                stair_start_x + stair_steps * stair_tread + landing_length + half_length_x
-            )
-            if near_stairs and abs(y) < 0.5 * stair_width + half_length_y + 0.15:
-                attempts += 1
-                continue
-            return np.array([x, y], dtype=np.float32)
-        return None
-
-    for index in range(int(rng.integers(3, 7))):
-        size_x = float(rng.uniform(0.2, 2.0))
-        size_y = float(rng.uniform(0.2, 2.0))
-        size_z = float(rng.uniform(0.08, 0.25))
-        center_xy = sample_side_center(0.5 * size_x, 0.5 * size_y)
-        if center_xy is None:
-            continue
-        boxes_local.append(
-            BoxPrimitive(
-                name=f"box_{index:02d}",
-                center=np.array([center_xy[0], center_xy[1], 0.5 * size_z], dtype=np.float32),
-                size=np.array([size_x, size_y, size_z], dtype=np.float32),
-                yaw_radians=float(rng.uniform(-0.6, 0.6)),
-            )
-        )
-
-    for index in range(int(rng.integers(2, 5))):
-        side_size = float(rng.uniform(0.08, 0.18))
-        center_xy = sample_side_center(0.5 * side_size, 0.5 * side_size)
-        if center_xy is None:
-            continue
-        boxes_local.append(
-            BoxPrimitive(
+    for index in range(DATACOLLECT_POLE_COUNT):
+        side_index = 0 if index < (DATACOLLECT_POLE_COUNT // 2) else 1
+        cylinders_local.append(
+            CylinderPrimitive(
                 name=f"pole_{index:02d}",
-                center=np.array([center_xy[0], center_xy[1], 0.5 * DEFAULT_POLE_HEIGHT], dtype=np.float32),
-                size=np.array([side_size, side_size, DEFAULT_POLE_HEIGHT], dtype=np.float32),
-                yaw_radians=0.0,
+                center=np.array(
+                    [
+                        float(rng.uniform(pole_x_min, pole_x_max)),
+                        float(pole_y_positions[side_index]),
+                        0.5 * DATACOLLECT_POLE_HEIGHT,
+                    ],
+                    dtype=np.float32,
+                ),
+                radius=float(DATACOLLECT_POLE_RADIUS),
+                height=float(DATACOLLECT_POLE_HEIGHT),
             )
         )
 
     return SceneDescription(
-        scene_yaw_radians=scene_yaw_radians,
-        path_length=path_length,
+        layout=DATACOLLECT_SCENE_LAYOUT,
+        scene_scale_ratio=scene_scale_ratio,
+        path_length=float(args.path_length),
         corridor_width=corridor_width,
-        stair_start_x=stair_start_x,
+        stair_start_x=float(DATACOLLECT_STAIR_START_OFFSET_X),
         stair_tread=stair_tread,
         stair_rise=stair_rise,
         stair_steps=stair_steps,
         stair_width=stair_width,
-        landing_length=landing_length,
-        ground_size=np.array([ground_length, ground_width, 0.02], dtype=np.float32),
-        boxes_local=tuple(boxes_local),
+        stair_start_x_opposite=float(-DATACOLLECT_STAIR_START_OFFSET_X),
+        box_size=box_size,
+        pole_radius=float(DATACOLLECT_POLE_RADIUS),
+        pole_height=float(DATACOLLECT_POLE_HEIGHT),
+        ground_size=ground_size,
+        cuboids_local=tuple(cuboids_local),
+        cylinders_local=tuple(cylinders_local),
+        support_boxes_local=tuple(support_boxes_local),
     )
 
 
-def world_box_from_local(local_box: BoxPrimitive, scene_yaw_radians: float) -> BoxPrimitive:
-    scene_transform = pose_matrix_from_yaw([0.0, 0.0, 0.0], scene_yaw_radians)
-    center_world = transform_points(local_box.center[None, :], scene_transform)[0]
+def world_box_from_local(local_box: BoxPrimitive) -> BoxPrimitive:
     return BoxPrimitive(
         name=local_box.name,
-        center=center_world,
+        center=local_box.center.astype(np.float32, copy=False),
         size=local_box.size.astype(np.float32, copy=False),
-        yaw_radians=float(scene_yaw_radians + local_box.yaw_radians),
+        yaw_radians=float(local_box.yaw_radians),
         top_only=local_box.top_only,
     )
 
@@ -714,7 +852,7 @@ def sample_box_surface_points(box: BoxPrimitive, spacing: float) -> np.ndarray:
 
 
 def build_scene_ground_truth(scene: SceneDescription, spacing: float) -> np.ndarray:
-    world_boxes = [world_box_from_local(box, scene.scene_yaw_radians) for box in scene.boxes_local]
+    world_boxes = [world_box_from_local(box) for box in scene.cuboids_local]
     samples = [sample_box_surface_points(box, spacing) for box in world_boxes]
     if not samples:
         return np.empty((0, 3), dtype=np.float32)
@@ -744,13 +882,10 @@ def generate_sinusoid_robot_poses(
     tangents = np.gradient(positions_local[:, :2], axis=0)
     yaw_local[:] = np.arctan2(tangents[:, 1], tangents[:, 0]).astype(np.float32) + yaw_bias
 
-    scene_rotation = yaw_rotation_matrix(scene.scene_yaw_radians)
     poses = np.zeros((timesteps, 4, 4), dtype=np.float32)
 
     for index in range(timesteps):
-        world_position = positions_local[index] @ scene_rotation.T
-        world_yaw = float(scene.scene_yaw_radians + yaw_local[index])
-        poses[index] = pose_matrix_from_yaw(world_position, world_yaw)
+        poses[index] = pose_matrix_from_yaw(positions_local[index], float(yaw_local[index]))
 
     return poses.astype(np.float32, copy=False)
 
@@ -769,14 +904,14 @@ def generate_velocity_command_robot_poses(
     yaw_rate_range = tuple(math.radians(value) for value in yaw_rate_range_deg)
     resample_steps = max(1, int(args.command_resample_steps))
 
-    x_limit = max(0.5 * scene.path_length - 0.25, 0.25)
-    y_limit = max(0.5 * scene.corridor_width - 0.20, 0.0)
+    x_limit = max(0.5 * scene.path_length - 1.0, 0.25)
+    y_limit = max(0.5 * scene.corridor_width - 0.35, 0.0)
 
     positions_local = np.zeros((timesteps, 3), dtype=np.float32)
     yaw_local = np.zeros((timesteps,), dtype=np.float32)
 
-    positions_local[0, 0] = -min(0.4 * scene.path_length, x_limit)
-    positions_local[0, 1] = float(rng.uniform(-0.10, 0.10)) if y_limit > 0.0 else 0.0
+    positions_local[0, 0] = -x_limit
+    positions_local[0, 1] = 0.0
     yaw_local[0] = float(rng.uniform(-math.radians(15.0), math.radians(15.0)))
 
     body_velocity_command = np.array(
@@ -813,12 +948,9 @@ def generate_velocity_command_robot_poses(
         next_xy[1] = float(np.clip(next_xy[1], -y_limit, y_limit))
         positions_local[index + 1, :2] = next_xy
 
-    scene_rotation = yaw_rotation_matrix(scene.scene_yaw_radians)
     poses = np.zeros((timesteps, 4, 4), dtype=np.float32)
     for index in range(timesteps):
-        world_position = positions_local[index] @ scene_rotation.T
-        world_yaw = float(scene.scene_yaw_radians + yaw_local[index])
-        poses[index] = pose_matrix_from_yaw(world_position, world_yaw)
+        poses[index] = pose_matrix_from_yaw(positions_local[index], float(yaw_local[index]))
 
     return poses.astype(np.float32, copy=False)
 
@@ -847,6 +979,7 @@ def save_manifest(
     robot_usd_path: str,
     trajectories: List[Dict[str, object]],
     camera_mounts: Sequence[CameraMount],
+    camera_profile: CameraProfile,
 ) -> None:
     manifest = {
         "paper_defaults": {
@@ -855,17 +988,28 @@ def save_manifest(
             "grid_bounds_min_m": GRID_BOUNDS_MIN.tolist(),
             "grid_bounds_max_m": GRID_BOUNDS_MAX.tolist(),
             "environment": {
+                "layout": DATACOLLECT_SCENE_LAYOUT,
+                "scene_length_m": DATACOLLECT_SCENE_LENGTH,
                 "stairs_tread_m": [0.2, 0.5],
                 "stairs_rise_m": [0.08, 0.25],
                 "box_width_length_m": [0.2, 2.0],
                 "box_height_m": [0.08, 0.25],
                 "corridor_width_m": [2.0, 6.0],
+                "sampling": "single_global_ratio",
+                "wall_height_m": DATACOLLECT_WALL_HEIGHT,
+                "wall_thickness_m": DATACOLLECT_WALL_THICKNESS,
+                "box_count": DATACOLLECT_BOX_COUNT,
+                "pole_count": DATACOLLECT_POLE_COUNT,
+                "pole_radius_m": DATACOLLECT_POLE_RADIUS,
+                "pole_height_m": DATACOLLECT_POLE_HEIGHT,
             },
             "sensor": {
                 "cameras": [mount.name for mount in camera_mounts],
                 "layout": "paper_cross",
                 "tilt_deg": args.camera_down_tilt_deg,
                 "resolution": [args.camera_width, args.camera_height],
+                "profile": camera_profile.name,
+                "intrinsics": camera_profile_metadata(camera_profile),
             },
             "motion": {
                 "source": args.motion_source,
@@ -932,7 +1076,7 @@ def run_collection(args: argparse.Namespace) -> None:
         from isaacsim.core.utils.stage import add_reference_to_stage
         from isaacsim.sensors.camera import Camera
         from isaacsim.storage.native import get_assets_root_path
-        from pxr import Gf, Usd, UsdGeom, UsdPhysics
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
         import torch
 
         rng = np.random.default_rng(args.seed)
@@ -1175,9 +1319,85 @@ def run_collection(args: argparse.Namespace) -> None:
                 debug["attempts"] = attempt_summaries
             return np.empty((0, 3), dtype=np.float32)
 
-        def create_cameras(*, capture_dt_effective: float, camera_mounts: Sequence[CameraMount]) -> Tuple[Dict[str, Camera], int]:
+        def set_camera_prim_attr(camera: Camera, attr_name: str, value: object, value_type) -> str:
+            stage = omni.usd.get_context().get_stage()
+            prim = stage.GetPrimAtPath(camera.prim_path)
+            if not prim.IsValid():
+                raise RuntimeError(f"Camera prim does not exist: {camera.prim_path}")
+            attr = prim.GetAttribute(attr_name)
+            if not attr.IsValid():
+                attr = prim.CreateAttribute(attr_name, value_type)
+            attr.Set(value)
+            return f"usd_attr:{attr_name}"
+
+        def configure_camera_profile(camera: Camera, camera_profile: CameraProfile) -> Dict[str, object]:
+            applied_settings: Dict[str, object] = {
+                "profile": camera_profile.name,
+                "intrinsics": camera_profile_metadata(camera_profile),
+                "applied": [],
+            }
+
+            def apply_setting(method_names: Sequence[str], *, attr_name: str, value: object, value_type) -> None:
+                for method_name in method_names:
+                    method = getattr(camera, method_name, None)
+                    if callable(method):
+                        try:
+                            method(value)
+                            applied_settings["applied"].append(f"camera_api:{method_name}")
+                            return
+                        except TypeError:
+                            if isinstance(value, (int, float)):
+                                method(float(value))
+                                applied_settings["applied"].append(f"camera_api:{method_name}")
+                                return
+                    setter = getattr(camera, f"set_{method_name}", None)
+                    if callable(setter):
+                        try:
+                            setter(value)
+                            applied_settings["applied"].append(f"camera_api:set_{method_name}")
+                            return
+                        except TypeError:
+                            if isinstance(value, (int, float)):
+                                setter(float(value))
+                                applied_settings["applied"].append(f"camera_api:set_{method_name}")
+                                return
+                applied_settings["applied"].append(set_camera_prim_attr(camera, attr_name, value, value_type))
+
+            apply_setting(
+                ("set_projection_type", "set_projection_mode"),
+                attr_name="projection",
+                value="pinhole",
+                value_type=Sdf.ValueTypeNames.Token,
+            )
+            apply_setting(
+                ("set_focal_length", "focal_length"),
+                attr_name="focalLength",
+                value=float(camera_profile.focal_length_mm),
+                value_type=Sdf.ValueTypeNames.Float,
+            )
+            apply_setting(
+                ("set_horizontal_aperture", "horizontal_aperture"),
+                attr_name="horizontalAperture",
+                value=float(camera_profile.horizontal_aperture_mm),
+                value_type=Sdf.ValueTypeNames.Float,
+            )
+            apply_setting(
+                ("set_vertical_aperture", "vertical_aperture"),
+                attr_name="verticalAperture",
+                value=float(camera_profile.vertical_aperture_mm),
+                value_type=Sdf.ValueTypeNames.Float,
+            )
+            return applied_settings
+
+        def create_cameras(
+            *,
+            capture_dt_effective: float,
+            camera_mounts: Sequence[CameraMount],
+            camera_profile: CameraProfile,
+        ) -> Tuple[Dict[str, Camera], int, Dict[str, Dict[str, object]]]:
             camera_frequency_hz = max(1, int(round(1.0 / capture_dt_effective)))
             cameras: Dict[str, Camera] = {}
+            camera_runtime_profiles: Dict[str, Dict[str, object]] = {}
             for mount in camera_mounts:
                 camera = Camera(
                     prim_path=f"/World/Sensors/{mount.name}",
@@ -1203,12 +1423,13 @@ def run_collection(args: argparse.Namespace) -> None:
                     camera.set_frequency(camera_frequency_hz)
                 if hasattr(camera, "set_clipping_range"):
                     camera.set_clipping_range(args.camera_min_range, args.camera_max_range)
+                camera_runtime_profiles[mount.name] = configure_camera_profile(camera, camera_profile)
                 camera.add_distance_to_image_plane_to_frame()
                 camera.add_pointcloud_to_frame(include_unlabelled=True)
                 if hasattr(camera, "resume"):
                     camera.resume()
                 cameras[mount.name] = camera
-            return cameras, camera_frequency_hz
+            return cameras, camera_frequency_hz, camera_runtime_profiles
 
         def apply_robot_and_camera_pose(
             robot_pose: np.ndarray,
@@ -1247,8 +1468,7 @@ def run_collection(args: argparse.Namespace) -> None:
             UsdGeom.SetStageMetersPerUnit(stage, 1.0)
             root = UsdGeom.Xform.Define(stage, "/Scene")
             stage.SetDefaultPrim(root.GetPrim())
-            world_boxes = [world_box_from_local(box, scene.scene_yaw_radians) for box in scene.boxes_local]
-            for box in world_boxes:
+            for box in scene.cuboids_local:
                 cube = UsdGeom.Cube.Define(stage, f"/Scene/{sanitize_prim_name(box.name)}")
                 cube.CreateSizeAttr(2.0)
                 translate_op = cube.AddTranslateOp()
@@ -1265,6 +1485,17 @@ def run_collection(args: argparse.Namespace) -> None:
                 scale_op.Set(Gf.Vec3f(float(box.size[0] * 0.5), float(box.size[1] * 0.5), float(box.size[2] * 0.5)))
                 UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
                 cube.GetDisplayColorAttr().Set([Gf.Vec3f(0.45, 0.45, 0.45)])
+            for cylinder in scene.cylinders_local:
+                cylinder_geom = UsdGeom.Cylinder.Define(stage, f"/Scene/{sanitize_prim_name(cylinder.name)}")
+                cylinder_geom.CreateAxisAttr(UsdGeom.Tokens.z)
+                cylinder_geom.CreateRadiusAttr(float(cylinder.radius))
+                cylinder_geom.CreateHeightAttr(float(cylinder.height))
+                translate_op = cylinder_geom.AddTranslateOp()
+                translate_op.Set(
+                    Gf.Vec3d(float(cylinder.center[0]), float(cylinder.center[1]), float(cylinder.center[2]))
+                )
+                UsdPhysics.CollisionAPI.Apply(cylinder_geom.GetPrim())
+                cylinder_geom.GetDisplayColorAttr().Set([Gf.Vec3f(0.35, 0.35, 0.35)])
             stage.GetRootLayer().Save()
 
         def triangulate_scene_mesh(root_prim_path: str) -> np.ndarray:
@@ -1310,6 +1541,58 @@ def run_collection(args: argparse.Namespace) -> None:
                 )
                 return [world_vertices[np.asarray(indices, dtype=np.int32)] for indices in triangle_indices]
 
+            def cylinder_triangles(cylinder_prim: Usd.Prim) -> List[np.ndarray]:
+                cylinder = UsdGeom.Cylinder(cylinder_prim)
+                axis = cylinder.GetAxisAttr().Get()
+                if axis not in (None, UsdGeom.Tokens.z):
+                    raise RuntimeError(
+                        f"Unsupported cylinder axis for mesh ground truth: {cylinder_prim.GetPath()} ({axis})"
+                    )
+                radius_attr = cylinder.GetRadiusAttr().Get()
+                height_attr = cylinder.GetHeightAttr().Get()
+                radius = float(radius_attr) if radius_attr is not None else 1.0
+                height = float(height_attr) if height_attr is not None else 2.0
+                half_height = 0.5 * height
+                segments = 32
+                angles = np.linspace(0.0, 2.0 * math.pi, segments, endpoint=False, dtype=np.float32)
+                ring_xy = np.stack((radius * np.cos(angles), radius * np.sin(angles)), axis=1).astype(np.float32, copy=False)
+                local_top = np.column_stack((ring_xy, np.full((segments,), half_height, dtype=np.float32))).astype(
+                    np.float32,
+                    copy=False,
+                )
+                local_bottom = np.column_stack((ring_xy, np.full((segments,), -half_height, dtype=np.float32))).astype(
+                    np.float32,
+                    copy=False,
+                )
+                local_vertices = np.concatenate(
+                    (
+                        local_bottom,
+                        local_top,
+                        np.array([[0.0, 0.0, -half_height], [0.0, 0.0, half_height]], dtype=np.float32),
+                    ),
+                    axis=0,
+                )
+                matrix = xform_cache.GetLocalToWorldTransform(cylinder_prim)
+                world_vertices = np.stack([transform_point(matrix, vertex) for vertex in local_vertices], axis=0)
+                bottom_center_index = 2 * segments
+                top_center_index = 2 * segments + 1
+                triangles_local: List[np.ndarray] = []
+                for index in range(segments):
+                    next_index = (index + 1) % segments
+                    bottom_i = index
+                    bottom_j = next_index
+                    top_i = segments + index
+                    top_j = segments + next_index
+                    triangles_local.append(world_vertices[np.asarray([bottom_i, bottom_j, top_j], dtype=np.int32)])
+                    triangles_local.append(world_vertices[np.asarray([bottom_i, top_j, top_i], dtype=np.int32)])
+                    triangles_local.append(
+                        world_vertices[np.asarray([top_center_index, top_i, top_j], dtype=np.int32)]
+                    )
+                    triangles_local.append(
+                        world_vertices[np.asarray([bottom_center_index, bottom_j, bottom_i], dtype=np.int32)]
+                    )
+                return triangles_local
+
             def mesh_triangles(mesh_prim: Usd.Prim) -> List[np.ndarray]:
                 mesh = UsdGeom.Mesh(mesh_prim)
                 points_attr = mesh.GetPointsAttr().Get()
@@ -1344,6 +1627,9 @@ def run_collection(args: argparse.Namespace) -> None:
 
                 if prim.IsA(UsdGeom.Cube):
                     triangles.extend(cube_triangles(prim))
+                    continue
+                if prim.IsA(UsdGeom.Cylinder):
+                    triangles.extend(cylinder_triangles(prim))
                     continue
                 if prim.IsA(UsdGeom.Mesh):
                     triangles.extend(mesh_triangles(prim))
@@ -1568,6 +1854,8 @@ def run_collection(args: argparse.Namespace) -> None:
             trajectory_poses: np.ndarray,
             scene: SceneDescription,
             scene_usd_path: Path,
+            camera_profile: CameraProfile,
+            camera_runtime_profiles: Dict[str, Dict[str, object]],
             capture_step_count: int,
             capture_dt_effective: float,
             camera_frequency_hz: int,
@@ -1607,7 +1895,12 @@ def run_collection(args: argparse.Namespace) -> None:
                 "motion_source": args.motion_source,
                 "policy_task": args.policy_task if args.motion_source == "policy_rollout" else None,
                 "ground_truth_source": "sim_mesh_dense_sampling",
+                "scene_layout": scene.layout,
+                "scene_scale_ratio": float(scene.scene_scale_ratio),
                 "camera_layout": "paper_cross",
+                "camera_profile": camera_profile.name,
+                "camera_intrinsics": camera_profile_metadata(camera_profile),
+                "camera_runtime_profiles": camera_runtime_profiles,
                 "save_raw_camera_clouds": bool(args.save_raw_camera_clouds),
                 "debug_file": f"{trajectory_name}{suffix}.debug.json" if args.debug_camera else None,
                 "scene_usd": str(scene_usd_path),
@@ -1620,15 +1913,19 @@ def run_collection(args: argparse.Namespace) -> None:
                 "camera_frequency_hz": int(camera_frequency_hz),
                 "path_length_m": scene.path_length,
                 "corridor_width_m": scene.corridor_width,
-                "scene_yaw_deg": math.degrees(scene.scene_yaw_radians),
                 "stairs": {
-                    "start_x_m": scene.stair_start_x,
+                    "start_x_positive_m": scene.stair_start_x,
+                    "start_x_negative_m": scene.stair_start_x_opposite,
                     "tread_m": scene.stair_tread,
                     "rise_m": scene.stair_rise,
                     "steps": scene.stair_steps,
                     "width_m": scene.stair_width,
-                    "landing_length_m": scene.landing_length,
                 },
+                "box_size_m": scene.box_size.tolist(),
+                "box_count": DATACOLLECT_BOX_COUNT,
+                "pole_count": DATACOLLECT_POLE_COUNT,
+                "pole_radius_m": float(scene.pole_radius),
+                "pole_height_m": float(scene.pole_height),
                 "measurement_points": int(measurement_points.shape[0]),
                 "ground_truth_points": int(ground_truth_points.shape[0]),
                 "measurement_points_per_timestep": [int(points.shape[0]) for points in measurements_local],
@@ -1654,6 +1951,8 @@ def run_collection(args: argparse.Namespace) -> None:
             *,
             trajectory_index: int,
             scene: SceneDescription,
+            camera_profile: CameraProfile,
+            camera_runtime_profiles: Dict[str, Dict[str, object]],
             capture_step_count: int,
             capture_dt_effective: float,
             camera_frequency_hz: int,
@@ -1672,6 +1971,11 @@ def run_collection(args: argparse.Namespace) -> None:
                 "camera_debug_enabled": True,
                 "motion_source": args.motion_source,
                 "ground_truth_source": "sim_mesh_dense_sampling",
+                "scene_layout": scene.layout,
+                "scene_scale_ratio": float(scene.scene_scale_ratio),
+                "camera_profile": camera_profile.name,
+                "camera_intrinsics": camera_profile_metadata(camera_profile),
+                "camera_runtime_profiles": camera_runtime_profiles,
                 "physics_dt": float(args.physics_dt),
                 "capture_dt_requested": float(args.capture_dt),
                 "capture_substeps": int(capture_step_count),
@@ -1682,15 +1986,19 @@ def run_collection(args: argparse.Namespace) -> None:
                 "scene": {
                     "path_length_m": scene.path_length,
                     "corridor_width_m": scene.corridor_width,
-                    "scene_yaw_deg": math.degrees(scene.scene_yaw_radians),
                     "stairs": {
-                        "start_x_m": scene.stair_start_x,
+                        "start_x_positive_m": scene.stair_start_x,
+                        "start_x_negative_m": scene.stair_start_x_opposite,
                         "tread_m": scene.stair_tread,
                         "rise_m": scene.stair_rise,
                         "steps": scene.stair_steps,
                         "width_m": scene.stair_width,
-                        "landing_length_m": scene.landing_length,
                     },
+                    "box_size_m": scene.box_size.tolist(),
+                    "box_count": DATACOLLECT_BOX_COUNT,
+                    "pole_count": DATACOLLECT_POLE_COUNT,
+                    "pole_radius_m": float(scene.pole_radius),
+                    "pole_height_m": float(scene.pole_height),
                 },
                 "timesteps": debug_steps,
             }
@@ -1739,6 +2047,7 @@ def run_collection(args: argparse.Namespace) -> None:
         print(f"[collector] resolved robot source: {robot_usd_path}", flush=True)
 
         camera_mounts = build_camera_mounts(args)
+        camera_profile = build_camera_profile(args.camera_width, args.camera_height)
         max_points_per_camera = max(1, int(math.ceil(args.max_measurement_points / max(1, len(camera_mounts)))))
         fallback_capture_steps = max(1, int(round(args.capture_dt / args.physics_dt)))
         fallback_capture_dt_effective = fallback_capture_steps * args.physics_dt
@@ -1786,6 +2095,7 @@ def run_collection(args: argparse.Namespace) -> None:
             capture_step_count = fallback_capture_steps
             capture_dt_effective = fallback_capture_dt_effective
             camera_frequency_hz = max(1, int(round(1.0 / capture_dt_effective)))
+            camera_runtime_profiles: Dict[str, Dict[str, object]] = {}
             ui_interrupted = False
             rollout_interrupted = False
 
@@ -1797,9 +2107,10 @@ def run_collection(args: argparse.Namespace) -> None:
                 add_reference_to_stage(str(scene_usd_path), "/World/Scene")
                 add_reference_to_stage(robot_usd_path, "/World/Robot")
                 robot = SingleArticulation(prim_path="/World/Robot", name=f"anymal_c_{trajectory_index:03d}")
-                cameras, camera_frequency_hz = create_cameras(
+                cameras, camera_frequency_hz, camera_runtime_profiles = create_cameras(
                     capture_dt_effective=capture_dt_effective,
                     camera_mounts=camera_mounts,
+                    camera_profile=camera_profile,
                 )
 
                 world.reset()
@@ -1878,9 +2189,10 @@ def run_collection(args: argparse.Namespace) -> None:
                 capture_step_count = max(1, int(round(args.capture_dt / policy_step_dt)))
                 capture_dt_effective = capture_step_count * policy_step_dt
                 create_prim("/World/Sensors", "Xform")
-                cameras, camera_frequency_hz = create_cameras(
+                cameras, camera_frequency_hz, camera_runtime_profiles = create_cameras(
                     capture_dt_effective=capture_dt_effective,
                     camera_mounts=camera_mounts,
+                    camera_profile=camera_profile,
                 )
                 policy = load_torchscript_policy(args.policy_checkpoint, args.policy_device)
                 obs, _ = policy_env.reset()
@@ -1964,6 +2276,8 @@ def run_collection(args: argparse.Namespace) -> None:
                         trajectory_poses=np.asarray(collected_poses, dtype=np.float32),
                         scene=scene,
                         scene_usd_path=scene_usd_path,
+                        camera_profile=camera_profile,
+                        camera_runtime_profiles=camera_runtime_profiles,
                         capture_step_count=capture_step_count,
                         capture_dt_effective=capture_dt_effective,
                         camera_frequency_hz=camera_frequency_hz,
@@ -1977,13 +2291,15 @@ def run_collection(args: argparse.Namespace) -> None:
                 save_debug_artifacts(
                     trajectory_index=trajectory_index,
                     scene=scene,
+                    camera_profile=camera_profile,
+                    camera_runtime_profiles=camera_runtime_profiles,
                     capture_step_count=capture_step_count,
                     capture_dt_effective=capture_dt_effective,
                     camera_frequency_hz=camera_frequency_hz,
                     debug_steps=trajectory_debug_steps,
                     partial=True,
                 )
-                save_manifest(args.output_dir, args, robot_usd_path, trajectories_meta, camera_mounts)
+                save_manifest(args.output_dir, args, robot_usd_path, trajectories_meta, camera_mounts, camera_profile)
                 return
 
             if rollout_interrupted:
@@ -1996,6 +2312,8 @@ def run_collection(args: argparse.Namespace) -> None:
                     trajectory_poses=np.asarray(collected_poses, dtype=np.float32),
                     scene=scene,
                     scene_usd_path=scene_usd_path,
+                    camera_profile=camera_profile,
+                    camera_runtime_profiles=camera_runtime_profiles,
                     capture_step_count=capture_step_count,
                     capture_dt_effective=capture_dt_effective,
                     camera_frequency_hz=camera_frequency_hz,
@@ -2008,6 +2326,8 @@ def run_collection(args: argparse.Namespace) -> None:
                 save_debug_artifacts(
                     trajectory_index=trajectory_index,
                     scene=scene,
+                    camera_profile=camera_profile,
+                    camera_runtime_profiles=camera_runtime_profiles,
                     capture_step_count=capture_step_count,
                     capture_dt_effective=capture_dt_effective,
                     camera_frequency_hz=camera_frequency_hz,
@@ -2023,6 +2343,8 @@ def run_collection(args: argparse.Namespace) -> None:
                 trajectory_poses=np.asarray(collected_poses, dtype=np.float32),
                 scene=scene,
                 scene_usd_path=scene_usd_path,
+                camera_profile=camera_profile,
+                camera_runtime_profiles=camera_runtime_profiles,
                 capture_step_count=capture_step_count,
                 capture_dt_effective=capture_dt_effective,
                 camera_frequency_hz=camera_frequency_hz,
@@ -2035,6 +2357,8 @@ def run_collection(args: argparse.Namespace) -> None:
             save_debug_artifacts(
                 trajectory_index=trajectory_index,
                 scene=scene,
+                camera_profile=camera_profile,
+                camera_runtime_profiles=camera_runtime_profiles,
                 capture_step_count=capture_step_count,
                 capture_dt_effective=capture_dt_effective,
                 camera_frequency_hz=camera_frequency_hz,
@@ -2056,7 +2380,7 @@ def run_collection(args: argparse.Namespace) -> None:
                 flush=True,
             )
 
-        save_manifest(args.output_dir, args, robot_usd_path, trajectories_meta, camera_mounts)
+        save_manifest(args.output_dir, args, robot_usd_path, trajectories_meta, camera_mounts, camera_profile)
         write_status("completed", stage="done", trajectories_saved=len(trajectories_meta))
         print(f"Dataset collection completed: {args.output_dir}", flush=True)
     except BaseException as exc:
