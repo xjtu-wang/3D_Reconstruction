@@ -35,6 +35,7 @@ from src.preprocess import (
     decode_predictions_to_point_clouds,
     make_batched_coordinate_tensor,
     make_batched_feature_tensor,
+    voxelize_points,
 )
 
 
@@ -102,25 +103,25 @@ def parse_args() -> argparse.Namespace:
         "--measurement-max-points",
         type=int,
         default=16000,
-        help="Maximum measurement points rendered per panel.",
+        help="Maximum occupied measurement voxels rendered per panel.",
     )
     parser.add_argument(
         "--prediction-max-points",
         type=int,
         default=20000,
-        help="Maximum predicted points rendered per panel.",
+        help="Maximum occupied prediction voxels rendered per panel.",
     )
     parser.add_argument(
         "--ground-truth-max-points",
         type=int,
         default=20000,
-        help="Maximum ground-truth points rendered per panel.",
+        help="Maximum occupied ground-truth voxels rendered per panel.",
     )
     parser.add_argument(
         "--point-size",
         type=float,
         default=1.4,
-        help="Matplotlib scatter marker size.",
+        help="Voxel edge width scale kept for backward compatibility.",
     )
     parser.add_argument(
         "--elev",
@@ -358,6 +359,82 @@ def sequence_point_counts(clouds: Sequence[np.ndarray]) -> List[int]:
     return [int(cloud.shape[0]) for cloud in clouds]
 
 
+def voxelize_cloud(points: np.ndarray, grid: GridConfig) -> np.ndarray:
+    voxelized = voxelize_points(points, grid, time_index=grid.current_time_index)
+    if voxelized.coordinates.size == 0:
+        return np.empty((0, 3), dtype=np.int32)
+    return voxelized.coordinates[:, :3].astype(np.int32, copy=False)
+
+
+def voxelize_sequence(clouds: Sequence[np.ndarray], grid: GridConfig) -> List[np.ndarray]:
+    return [voxelize_cloud(cloud, grid) for cloud in clouds]
+
+
+def sequence_voxel_counts(voxel_clouds: Sequence[np.ndarray]) -> List[int]:
+    return [int(cloud.shape[0]) for cloud in voxel_clouds]
+
+
+def _row_view(array: np.ndarray) -> np.ndarray:
+    contiguous = np.ascontiguousarray(array)
+    if contiguous.size == 0:
+        return np.empty((0,), dtype=np.dtype((np.void, 0)))
+    return contiguous.view(np.dtype((np.void, contiguous.dtype.itemsize * contiguous.shape[1]))).reshape(-1)
+
+
+def occupancy_metrics(query_voxels: np.ndarray, target_voxels: np.ndarray) -> Dict[str, float]:
+    query_unique = np.unique(_row_view(query_voxels))
+    target_unique = np.unique(_row_view(target_voxels))
+    if query_unique.size == 0 and target_unique.size == 0:
+        return {"precision": 1.0, "recall": 1.0, "f1": 1.0, "iou": 1.0}
+    if query_unique.size == 0:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "iou": 0.0}
+    if target_unique.size == 0:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "iou": 0.0}
+
+    overlap = np.intersect1d(query_unique, target_unique, assume_unique=True).size
+    precision = float(overlap / query_unique.size)
+    recall = float(overlap / target_unique.size)
+    f1 = float((2.0 * precision * recall / (precision + recall)) if (precision + recall) > 0.0 else 0.0)
+    union = query_unique.size + target_unique.size - overlap
+    iou = float(overlap / union) if union > 0 else 0.0
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "iou": iou,
+    }
+
+
+def sequence_occupancy_metrics(query_sequence: Sequence[np.ndarray], target_sequence: Sequence[np.ndarray]) -> Dict[str, List[float]]:
+    metrics = {
+        "precision": [],
+        "recall": [],
+        "f1": [],
+        "iou": [],
+    }
+    for query_voxels, target_voxels in zip(query_sequence, target_sequence):
+        timestep_metrics = occupancy_metrics(query_voxels, target_voxels)
+        for key, value in timestep_metrics.items():
+            metrics[key].append(float(value))
+    return metrics
+
+
+def summarize_metric_sequence(values: Sequence[float]) -> Dict[str, Optional[float]]:
+    if not values:
+        return {"min": None, "max": None, "mean": None, "median": None}
+    values_array = np.asarray(values, dtype=np.float32)
+    return {
+        "min": float(values_array.min()),
+        "max": float(values_array.max()),
+        "mean": float(values_array.mean()),
+        "median": float(np.median(values_array)),
+    }
+
+
+def summarize_metric_dict(metrics: Dict[str, List[float]]) -> Dict[str, Dict[str, Optional[float]]]:
+    return {key: summarize_metric_sequence(values) for key, values in metrics.items()}
+
+
 def summarize_counts(counts: Sequence[int]) -> Dict[str, Optional[float]]:
     if not counts:
         return {
@@ -375,11 +452,11 @@ def summarize_counts(counts: Sequence[int]) -> Dict[str, Optional[float]]:
     }
 
 
-def downsample_points(points: np.ndarray, max_points: int, rng: np.random.Generator) -> np.ndarray:
-    if max_points <= 0 or points.shape[0] <= max_points:
-        return points.astype(np.float32, copy=False)
-    indices = rng.choice(points.shape[0], size=max_points, replace=False)
-    return points[indices].astype(np.float32, copy=False)
+def downsample_rows(rows: np.ndarray, max_rows: int, rng: np.random.Generator) -> np.ndarray:
+    if max_rows <= 0 or rows.shape[0] <= max_rows:
+        return rows
+    indices = rng.choice(rows.shape[0], size=max_rows, replace=False)
+    return rows[indices]
 
 
 def style_axis(ax, bounds_min: np.ndarray, bounds_max: np.ndarray, elev: float, azim: float) -> None:
@@ -401,16 +478,17 @@ def style_axis(ax, bounds_min: np.ndarray, bounds_max: np.ndarray, elev: float, 
             axis.line.set_color((1.0, 1.0, 1.0, 0.0))
 
 
-def scatter_cloud(
+def render_voxel_cloud(
     ax,
-    points: np.ndarray,
-    max_points: int,
-    point_size: float,
+    voxel_coordinates: np.ndarray,
+    grid: GridConfig,
+    max_voxels: int,
+    edge_width_scale: float,
     rng: np.random.Generator,
     cmap,
     norm: colors.Normalize,
 ) -> int:
-    sampled = downsample_points(points, max_points, rng)
+    sampled = downsample_rows(voxel_coordinates, max_voxels, rng).astype(np.int32, copy=False)
     if sampled.size == 0:
         ax.text2D(
             0.5,
@@ -424,15 +502,27 @@ def scatter_cloud(
         )
         return 0
 
-    rgba = cmap(norm(sampled[:, 2]))
-    ax.scatter(
-        sampled[:, 0],
-        sampled[:, 1],
-        sampled[:, 2],
-        c=rgba,
-        s=point_size,
-        linewidths=0.0,
-        depthshade=False,
+    bounds_min = np.asarray(grid.bounds_min, dtype=np.float32)
+    spatial_shape = np.asarray(grid.spatial_shape, dtype=np.int32)
+    occupancy = np.zeros(tuple(spatial_shape.tolist()), dtype=bool)
+    occupancy[sampled[:, 0], sampled[:, 1], sampled[:, 2]] = True
+
+    facecolors = np.zeros(tuple(spatial_shape.tolist()) + (4,), dtype=np.float32)
+    voxel_centers_z = bounds_min[2] + grid.voxel_size * (sampled[:, 2].astype(np.float32) + 0.5)
+    facecolors[sampled[:, 0], sampled[:, 1], sampled[:, 2]] = cmap(norm(voxel_centers_z))
+
+    grid_x, grid_y, grid_z = np.indices(spatial_shape + 1, dtype=np.float32)
+    grid_x = bounds_min[0] + grid_x * grid.voxel_size
+    grid_y = bounds_min[1] + grid_y * grid.voxel_size
+    grid_z = bounds_min[2] + grid_z * grid.voxel_size
+    ax.voxels(
+        grid_x,
+        grid_y,
+        grid_z,
+        occupancy,
+        facecolors=facecolors,
+        edgecolor=(1.0, 1.0, 1.0, 0.06),
+        linewidth=max(0.02, 0.02 * edge_width_scale),
     )
     return int(sampled.shape[0])
 
@@ -441,9 +531,10 @@ def render_report_figure(
     output_path: Path,
     trajectory_name: str,
     timesteps: Sequence[int],
-    measurements: Sequence[np.ndarray],
-    predictions: Sequence[np.ndarray],
-    ground_truth: Sequence[np.ndarray],
+    measurement_voxels: Sequence[np.ndarray],
+    prediction_voxels: Sequence[np.ndarray],
+    ground_truth_voxels: Sequence[np.ndarray],
+    grid: GridConfig,
     bounds_min: np.ndarray,
     bounds_max: np.ndarray,
     point_size: float,
@@ -481,9 +572,9 @@ def render_report_figure(
 
     for column_index, timestep in enumerate(timesteps):
         panels = (
-            measurements[timestep],
-            predictions[timestep],
-            ground_truth[timestep],
+            measurement_voxels[timestep],
+            prediction_voxels[timestep],
+            ground_truth_voxels[timestep],
         )
         limits = (
             measurement_max_points,
@@ -495,11 +586,12 @@ def render_report_figure(
         for row_index, (points, max_points, key) in enumerate(zip(panels, limits, keys)):
             ax = axes[row_index, column_index]
             style_axis(ax, bounds_min, bounds_max, elev=elev, azim=azim)
-            count = scatter_cloud(
+            count = render_voxel_cloud(
                 ax=ax,
-                points=points,
-                max_points=max_points,
-                point_size=point_size,
+                voxel_coordinates=points,
+                grid=grid,
+                max_voxels=max_points,
+                edge_width_scale=point_size,
                 rng=rng,
                 cmap=cmap,
                 norm=norm,
@@ -523,7 +615,7 @@ def render_report_figure(
                 ax.set_title(f"Step {timestep}", fontsize=12, pad=12.0)
 
     mode_label = "current measurement only" if disable_feedback else "autoregressive rollout"
-    figure_title = title or f"{trajectory_name} | {mode_label}"
+    figure_title = title or f"{trajectory_name} | {mode_label} | occupied voxels"
     fig.suptitle(figure_title, fontsize=15, fontweight="semibold")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
@@ -540,6 +632,11 @@ def write_metadata(
     rendered_counts: Dict[str, List[int]],
     raw_counts: Dict[str, List[int]],
     raw_count_summary: Dict[str, Dict[str, Optional[float]]],
+    voxel_counts: Dict[str, List[int]],
+    voxel_count_summary: Dict[str, Dict[str, Optional[float]]],
+    voxel_metrics: Dict[str, Dict[str, List[float]]],
+    voxel_metric_summary: Dict[str, Dict[str, Dict[str, Optional[float]]]],
+    voxel_size_m: float,
     disable_feedback: bool,
     checkpoint_metadata: Dict[str, object],
 ) -> Path:
@@ -553,6 +650,11 @@ def write_metadata(
         "rendered_counts": rendered_counts,
         "raw_counts": raw_counts,
         "raw_count_summary": raw_count_summary,
+        "voxel_size_m": float(voxel_size_m),
+        "voxel_counts": voxel_counts,
+        "voxel_count_summary": voxel_count_summary,
+        "voxel_metrics": voxel_metrics,
+        "voxel_metric_summary": voxel_metric_summary,
         "checkpoint_epoch": checkpoint_metadata.get("epoch"),
         "checkpoint_global_step": checkpoint_metadata.get("global_step"),
         "train_metrics": checkpoint_metadata.get("train_metrics"),
@@ -617,14 +719,36 @@ def main() -> None:
         "prediction": summarize_counts(prediction_counts),
         "ground_truth": summarize_counts(ground_truth_counts),
     }
+    measurement_voxels = voxelize_sequence(measurements, grid)
+    prediction_voxels = voxelize_sequence(predictions, grid)
+    ground_truth_voxels = voxelize_sequence(ground_truth, grid)
+    voxel_counts = {
+        "measurement": sequence_voxel_counts(measurement_voxels),
+        "prediction": sequence_voxel_counts(prediction_voxels),
+        "ground_truth": sequence_voxel_counts(ground_truth_voxels),
+    }
+    voxel_count_summary = {
+        "measurement": summarize_counts(voxel_counts["measurement"]),
+        "prediction": summarize_counts(voxel_counts["prediction"]),
+        "ground_truth": summarize_counts(voxel_counts["ground_truth"]),
+    }
+    voxel_metrics = {
+        "measurement_vs_ground_truth": sequence_occupancy_metrics(measurement_voxels, ground_truth_voxels),
+        "prediction_vs_ground_truth": sequence_occupancy_metrics(prediction_voxels, ground_truth_voxels),
+    }
+    voxel_metric_summary = {
+        key: summarize_metric_dict(value)
+        for key, value in voxel_metrics.items()
+    }
     rollout_path = maybe_save_rollout(save_rollout_path, poses, predictions)
     rendered_counts = render_report_figure(
         output_path=output_path,
         trajectory_name=trajectory_path.name,
         timesteps=timesteps,
-        measurements=measurements,
-        predictions=predictions,
-        ground_truth=ground_truth,
+        measurement_voxels=measurement_voxels,
+        prediction_voxels=prediction_voxels,
+        ground_truth_voxels=ground_truth_voxels,
+        grid=grid,
         bounds_min=bounds_min,
         bounds_max=bounds_max,
         point_size=args.point_size,
@@ -646,6 +770,11 @@ def main() -> None:
         rendered_counts=rendered_counts,
         raw_counts=raw_counts,
         raw_count_summary=raw_count_summary,
+        voxel_counts=voxel_counts,
+        voxel_count_summary=voxel_count_summary,
+        voxel_metrics=voxel_metrics,
+        voxel_metric_summary=voxel_metric_summary,
+        voxel_size_m=grid.voxel_size,
         disable_feedback=args.disable_feedback,
         checkpoint_metadata=checkpoint_metadata,
     )
@@ -654,10 +783,23 @@ def main() -> None:
     print(f"trajectory: {trajectory_path}")
     print(f"device: {device}")
     print(f"timesteps shown: {timesteps}")
-    print(f"prediction count summary: {raw_count_summary['prediction']}")
+    print(f"prediction point-count summary: {raw_count_summary['prediction']}")
+    print(f"prediction voxel-count summary: {voxel_count_summary['prediction']}")
+    print(
+        "prediction voxel metric summary vs gt: "
+        f"{voxel_metric_summary['prediction_vs_ground_truth']}"
+    )
     print(
         "selected prediction counts: {}".format(
             {int(step): prediction_counts[step] for step in timesteps}
+        )
+    )
+    print(
+        "selected prediction voxel recall: {}".format(
+            {
+                int(step): voxel_metrics["prediction_vs_ground_truth"]["recall"][step]
+                for step in timesteps
+            }
         )
     )
     print(f"saved figure: {output_path}")
