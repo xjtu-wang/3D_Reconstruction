@@ -41,7 +41,7 @@ class SparseTransposeBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: Any, stride: Any) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            ME.MinkowskiConvolutionTranspose(
+            ME.MinkowskiGenerativeConvolutionTranspose(
                 in_channels,
                 out_channels,
                 kernel_size=kernel_size,
@@ -93,7 +93,13 @@ class DecoderStage(nn.Module):
 
     def forward(self, x: Any, skip: Any) -> Any:
         x = self.upsample(x)
-        x = ME.cat(x, skip)
+        skip_features = skip.features_at_coordinates(x.C.float())  # Ensure skip features are aligned with x
+        skip_on_x = ME.SparseTensor(
+            features=skip_features,
+            coordinate_map_key=x.coordinate_map_key,
+            coordinate_manager=x.coordinate_manager,
+        )
+        x = ME.cat(x, skip_on_x)
         x = self.fuse(x)
         return x
     
