@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint",
         type=Path,
         required=True,
-        help="Checkpoint produced by train.py.",
+        help="Checkpoint produced by main.py.",
     )
     parser.add_argument(
         "--trajectory",

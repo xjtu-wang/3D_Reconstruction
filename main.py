@@ -33,7 +33,7 @@ try:
     import MinkowskiEngine as ME
 except ImportError as error:  # pragma: no cover - environment-dependent
     raise ImportError(
-        "train.py requires MinkowskiEngine. Install it before running training."
+        "main.py requires MinkowskiEngine. Install it before running training."
     ) from error
 
 
@@ -44,6 +44,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", type=Path, required=True, help="Directory of packed .npz trajectories.")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument(
+        "--val-batch-size",
+        type=int,
+        default=0,
+        help="Validation batch size. Set <= 0 to use a safer auto value capped at 64.",
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--sequence-length", type=int, default=12)
     parser.add_argument("--sequence-stride", type=int, default=1)
@@ -56,12 +62,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-augmentation", action="store_true")
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=50)
-    parser.add_argument("--val-root", type=Path, default=None, help="Optional separate directory for validation .npz trajectories.")
+    parser.add_argument(
+        "--save-every-steps",
+        type=int,
+        default=0,
+        help="If > 0, save step_*.pt checkpoints every N optimizer steps.",
+    )
+    parser.add_argument(
+        "--validate-every-steps",
+        type=int,
+        default=0,
+        help="If > 0, run validation and update last.pt/best.pt every N optimizer steps.",
+    )
+    parser.add_argument(
+        "--disable-validation-during-training",
+        action="store_true",
+        help="Disable all validation during training. Save checkpoints first, then validate them offline later.",
+    )
+    parser.add_argument(
+        "--val-root",
+        type=Path,
+        default=None,
+        help="Optional separate directory for validation .npz trajectories. Recommended for scene-held-out validation.",
+    )
     parser.add_argument(
         "--val-fraction",
         type=float,
         default=0.1,
-        help="Validation fraction when splitting --data-root locally. Set to 0 to disable.",
+        help="Window-level validation split used only when --val-root is absent. This may leak neighboring windows from the same trajectory or scene.",
     )
     parser.add_argument(
         "--gradient-clip-norm",
@@ -164,7 +192,10 @@ def evaluate_model(
     if loader is None:
         return None
 
+    was_training = model.training
     model.eval()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     eval_rng = np.random.default_rng(0)
     loss_sums = {"total": 0.0, "occupancy": 0.0, "regression": 0.0}
     batch_count = 0
@@ -186,6 +217,10 @@ def evaluate_model(
             loss_sums[key] += float(losses[key].item())
         batch_count += 1
 
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    if was_training:
+        model.train()
     return mean_loss_dict(loss_sums, batch_count)
 
 
@@ -196,6 +231,7 @@ def checkpoint_payload(
     scheduler: torch.optim.lr_scheduler.ExponentialLR,
     scaler: object,
     epoch: int,
+    completed_epoch: bool,
     global_step: int,
     best_validation_loss: float,
     args: argparse.Namespace,
@@ -205,6 +241,7 @@ def checkpoint_payload(
 ) -> Dict[str, object]:
     return {
         "epoch": epoch,
+        "completed_epoch": completed_epoch,
         "global_step": global_step,
         "best_validation_loss": best_validation_loss,
         "model_state_dict": model.state_dict(),
@@ -269,7 +306,8 @@ def load_checkpoint_if_available(
     if "augmentation_rng_state" in checkpoint:
         augmentation_rng.bit_generator.state = checkpoint["augmentation_rng_state"]
 
-    start_epoch = int(checkpoint.get("epoch", 0)) + 1
+    completed_epoch = bool(checkpoint.get("completed_epoch", True))
+    start_epoch = int(checkpoint.get("epoch", 0)) + (1 if completed_epoch else 0)
     global_step = int(checkpoint.get("global_step", 0))
     best_validation_loss = float(checkpoint.get("best_validation_loss", float("inf")))
     return start_epoch, global_step, best_validation_loss
@@ -526,8 +564,10 @@ def main() -> None:
         sequence_stride=args.sequence_stride,
         cache_data=args.cache_dataset,
     )
-    if args.val_root is not None:
-        val_dataset: Optional[object] = TrajectoryDataset(
+    if args.disable_validation_during_training:
+        val_dataset = None
+    elif args.val_root is not None:
+        val_dataset = TrajectoryDataset(
             root=args.val_root,
             sequence_length=train_config.sequence_length,
             sequence_stride=args.sequence_stride,
@@ -550,10 +590,11 @@ def main() -> None:
         disable_persistent_workers=args.disable_persistent_workers,
         prefetch_factor=args.prefetch_factor,
     )
+    val_batch_size = args.val_batch_size if args.val_batch_size > 0 else min(train_config.batch_size, 64)
     val_loader = (
         make_data_loader(
             dataset=val_dataset,
-            batch_size=train_config.batch_size,
+            batch_size=val_batch_size,
             num_workers=train_config.num_workers,
             shuffle=False,
             use_cuda=use_cuda,
@@ -565,7 +606,9 @@ def main() -> None:
         else None
     )
     print(
-        f"train_windows={len(train_dataset)} val_windows={len(val_dataset) if val_dataset is not None else 0}",
+        f"train_windows={len(train_dataset)} val_windows={len(val_dataset) if val_dataset is not None else 0} "
+        f"train_batch_size={train_config.batch_size} val_batch_size={val_batch_size if val_dataset is not None else 0} "
+        f"validation_during_training={0 if args.disable_validation_during_training else 1}",
     )
 
     model = TerrainReconstructionModel(model_config).to(device)
@@ -575,7 +618,7 @@ def main() -> None:
         weight_decay=train_config.weight_decay,
     )
 
-    total_steps = max(len(train_loader) * train_config.sequence_length * train_config.epochs, 1)
+    total_steps = max(len(train_loader) * train_config.epochs * train_config.sequence_length, 1)
     gamma = math.exp(
         math.log(train_config.min_learning_rate / train_config.learning_rate) / total_steps
     )
@@ -598,6 +641,87 @@ def main() -> None:
             f"best_val={best_validation_loss:.4f}",
         )
     last_step_end = time.perf_counter()
+    latest_validation_metrics: Optional[Dict[str, float]] = None
+    last_validation_step = -1
+
+    def write_training_state(
+        *,
+        epoch: int,
+        global_step: int,
+        train_metrics: Dict[str, float],
+        completed_epoch: bool,
+        run_validation: bool,
+        numbered_checkpoint_path: Optional[Path],
+        summary_prefix: str,
+    ) -> Optional[Dict[str, float]]:
+        nonlocal best_validation_loss, latest_validation_metrics, last_validation_step
+
+        validation_metrics = latest_validation_metrics
+        is_best = False
+        if run_validation:
+            validation_metrics = evaluate_model(
+                model=model,
+                loader=val_loader,
+                grid_config=grid_config,
+                augmentation_config=augmentation_config,
+                device=device,
+                use_amp=use_amp,
+                autocast_dtype=autocast_dtype,
+                occupancy_weight=train_config.occupancy_loss_weight,
+                regression_weight=train_config.regression_loss_weight,
+            )
+            latest_validation_metrics = validation_metrics
+            last_validation_step = global_step
+            if validation_metrics is not None and validation_metrics["total"] < best_validation_loss:
+                best_validation_loss = validation_metrics["total"]
+                is_best = True
+
+        checkpoint = checkpoint_payload(
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            epoch=epoch,
+            completed_epoch=completed_epoch,
+            global_step=global_step,
+            best_validation_loss=best_validation_loss,
+            args=args,
+            augmentation_rng=rng,
+            train_metrics=train_metrics,
+            validation_metrics=validation_metrics,
+        )
+        if numbered_checkpoint_path is not None:
+            save_checkpoint(checkpoint, numbered_checkpoint_path)
+        save_checkpoint(checkpoint, train_config.output_dir / "last.pt")
+        if is_best:
+            save_checkpoint(checkpoint, train_config.output_dir / "best.pt")
+
+        if run_validation:
+            summary = (
+                f"{summary_prefix} epoch={epoch} step={global_step} "
+                f"train_loss={train_metrics['total']:.4f} "
+                f"train_occ={train_metrics['occupancy']:.4f} "
+                f"train_reg={train_metrics['regression']:.4f}"
+            )
+            if validation_metrics is not None:
+                summary += (
+                    f" val_loss={validation_metrics['total']:.4f}"
+                    f" val_occ={validation_metrics['occupancy']:.4f}"
+                    f" val_reg={validation_metrics['regression']:.4f}"
+                    f" best_val={best_validation_loss:.4f}"
+                )
+                if is_best:
+                    summary += " best=1"
+            if numbered_checkpoint_path is not None:
+                summary += f" checkpoint={numbered_checkpoint_path.name}"
+            print(summary)
+        elif numbered_checkpoint_path is not None:
+            print(
+                f"{summary_prefix} epoch={epoch} step={global_step} "
+                f"checkpoint={numbered_checkpoint_path.name}",
+            )
+
+        return validation_metrics
 
     for epoch in range(start_epoch, train_config.epochs + 1):
         model.train()
@@ -689,44 +813,49 @@ def main() -> None:
                     print(message)
                 global_step += 1
                 last_step_end = step_end_time
-            if batch_step_count == 0:
-                last_step_end = time.perf_counter()
+
+                should_validate = (
+                    val_loader is not None
+                    and args.validate_every_steps > 0
+                    and global_step % args.validate_every_steps == 0
+                )
+                should_save_step = (
+                    args.save_every_steps > 0
+                    and global_step % args.save_every_steps == 0
+                )
+                if should_validate or should_save_step:
+                    train_metrics = mean_loss_dict(train_loss_sums, train_step_count)
+                    numbered_checkpoint_path = (
+                        train_config.output_dir / f"step_{global_step:08d}.pt"
+                        if should_save_step
+                        else None
+                    )
+                    write_training_state(
+                        epoch=epoch,
+                        global_step=global_step,
+                        train_metrics=train_metrics,
+                        completed_epoch=False,
+                        run_validation=should_validate,
+                        numbered_checkpoint_path=numbered_checkpoint_path,
+                        summary_prefix="mid_epoch",
+                    )
 
         train_metrics = mean_loss_dict(train_loss_sums, train_step_count)
-        validation_metrics = evaluate_model(
-            model=model,
-            loader=val_loader,
-            grid_config=grid_config,
-            augmentation_config=augmentation_config,
-            device=device,
-            use_amp=use_amp,
-            autocast_dtype=autocast_dtype,
-            occupancy_weight=train_config.occupancy_loss_weight,
-            regression_weight=train_config.regression_loss_weight,
+        should_validate_epoch_end = val_loader is not None and last_validation_step != global_step
+        numbered_epoch_checkpoint_path = (
+            train_config.output_dir / f"epoch_{epoch:04d}.pt"
+            if train_config.save_every > 0 and epoch % train_config.save_every == 0
+            else None
         )
-        is_best = False
-        if validation_metrics is not None and validation_metrics["total"] < best_validation_loss:
-            best_validation_loss = validation_metrics["total"]
-            is_best = True
-
-        checkpoint = checkpoint_payload(
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=scaler,
+        validation_metrics = write_training_state(
             epoch=epoch,
             global_step=global_step,
-            best_validation_loss=best_validation_loss,
-            args=args,
-            augmentation_rng=rng,
             train_metrics=train_metrics,
-            validation_metrics=validation_metrics,
+            completed_epoch=True,
+            run_validation=should_validate_epoch_end,
+            numbered_checkpoint_path=numbered_epoch_checkpoint_path,
+            summary_prefix="epoch_end",
         )
-        if epoch % train_config.save_every == 0:
-            save_checkpoint(checkpoint, train_config.output_dir / f"epoch_{epoch:04d}.pt")
-        save_checkpoint(checkpoint, train_config.output_dir / "last.pt")
-        if is_best:
-            save_checkpoint(checkpoint, train_config.output_dir / "best.pt")
 
         summary = (
             f"epoch={epoch} train_loss={train_metrics['total']:.4f} "
@@ -740,8 +869,6 @@ def main() -> None:
                 f" val_reg={validation_metrics['regression']:.4f}"
                 f" best_val={best_validation_loss:.4f}"
             )
-            if is_best:
-                summary += " best=1"
         print(summary)
         last_step_end = time.perf_counter()
 
